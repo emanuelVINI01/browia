@@ -3,7 +3,7 @@ import { useAgentSession } from "./hooks/useAgentSession";
 import { SessionList } from "./components/SessionList";
 import { ChatContainer } from "./components/ChatContainer";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { Settings, Bot, Menu, Cpu } from "lucide-react";
+import { Settings, Menu, Cpu } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useI18n } from "./i18n";
 
@@ -50,8 +50,8 @@ function App() {
           </button>
           
           <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded bg-[rgba(214,168,79,0.1)] flex items-center justify-center border border-[rgba(214,168,79,0.2)]">
-              <Bot className="w-4.5 h-4.5 text-[var(--theme-primary)]" />
+            <div className="w-7 h-7 rounded bg-[rgba(214,168,79,0.1)] flex items-center justify-center border border-[rgba(214,168,79,0.2)] overflow-hidden">
+              <img src="/logo.png" className="w-6 h-6 object-contain" alt="Browia Logo" />
             </div>
             <h1 className="text-lg font-display font-black tracking-wider bg-gradient-to-r from-[var(--theme-primary-light)] to-[var(--theme-primary)] bg-clip-text text-transparent my-0">
               BROWIA

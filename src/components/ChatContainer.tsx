@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import type { Message } from "../services/storageService";
 import { MessageItem } from "./MessageItem";
-import { Send, Loader2, Sparkles, X, History, Camera, Search } from "lucide-react";
+import { Send, Loader2, X, History, Camera, Search } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { ExecutionApprovalPanel } from "./ExecutionApprovalPanel";
 import type { ApprovalRequestState } from "../hooks/useAgentSession";
@@ -274,8 +274,8 @@ export function ChatContainer({
             className="flex-1 flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto gap-6"
           >
             <div className="relative">
-              <div className="w-16 h-16 rounded-full bg-[rgba(214,168,79,0.1)] flex items-center justify-center border border-[rgba(214,168,79,0.2)]">
-                <Sparkles className="w-8 h-8 text-[var(--theme-primary)] neon-pulse rounded-full" />
+              <div className="w-18 h-18 rounded-full bg-[rgba(214,168,79,0.05)] flex items-center justify-center border border-[rgba(214,168,79,0.15)] overflow-hidden neon-pulse shadow-[0_0_20px_rgba(214,168,79,0.15)]">
+                <img src="/logo.png" className="w-16 h-16 object-contain" alt="Browia Logo" />
               </div>
             </div>
             <div>
