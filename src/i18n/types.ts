@@ -23,6 +23,7 @@ export interface TranslationKeys {
   settings_close: string;
   settings_tab_api?: string;
   settings_tab_google?: string;
+  settings_tab_general?: string;
   settings_tab_language?: string;
   settings_tab_prompt?: string;
   settings_api_title?: string;
@@ -31,10 +32,19 @@ export interface TranslationKeys {
   settings_google_desc?: string;
   settings_google_quota_title?: string;
   settings_google_quota_desc?: string;
+  settings_general_title?: string;
+  settings_general_desc?: string;
+  settings_general_auto_approve?: string;
+  settings_general_auto_approve_desc?: string;
   settings_language_title?: string;
   settings_language_desc?: string;
   settings_prompt_title?: string;
   settings_prompt_desc?: string;
+  auto_approve_modal_title?: string;
+  auto_approve_modal_warning?: string;
+  auto_approve_modal_risk_list?: string;
+  auto_approve_modal_confirm?: string;
+  auto_approve_modal_cancel?: string;
   settings_provider_label: string;
   settings_openai_key: string;
   settings_gemini_key: string;

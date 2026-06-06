@@ -283,6 +283,48 @@ export function PromptSettingsSection({ settings, setSettings }: PromptSettingsS
   );
 }
 
+interface GeneralSettingsSectionProps {
+  settings: AppSettings;
+  setSettings: Dispatch<SetStateAction<AppSettings>>;
+  onShowWarning: () => void;
+}
+
+export function GeneralSettingsSection({ settings, setSettings, onShowWarning }: GeneralSettingsSectionProps) {
+  const { t } = useI18n();
+
+  const handleToggle = (checked: boolean) => {
+    if (checked) {
+      onShowWarning();
+    } else {
+      setSettings((current) => ({ ...current, autoApproveSensitive: false }));
+    }
+  };
+
+  return (
+    <section className="flex flex-col gap-5">
+      <SectionHeader title={t.settings_general_title} description={t.settings_general_desc} />
+
+      <div className="flex items-start gap-3 rounded-lg border border-[var(--theme-border)] bg-[rgba(20,16,10,0.5)] p-4">
+        <input
+          id="auto-approve-toggle"
+          type="checkbox"
+          checked={Boolean(settings.autoApproveSensitive)}
+          onChange={(event) => handleToggle(event.target.checked)}
+          className="mt-1 h-4 w-4 cursor-pointer rounded border-[var(--theme-border)] bg-[var(--theme-surface-2)] text-[var(--theme-primary)] focus:ring-[var(--theme-primary)]"
+        />
+        <div className="flex flex-col gap-1">
+          <label htmlFor="auto-approve-toggle" className="cursor-pointer text-sm font-bold text-[var(--theme-primary-light)] select-none">
+            {t.settings_general_auto_approve}
+          </label>
+          <span className="text-xs text-[var(--theme-muted)] leading-relaxed select-none">
+            {t.settings_general_auto_approve_desc}
+          </span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 interface SectionHeaderProps {
   title: string;
   description: string;

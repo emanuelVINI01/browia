@@ -310,7 +310,14 @@ export class AgentLoop {
         const sensitiveStates = toolStates.slice(executedSafeTools.length);
         const plan = this.buildExecutionPlan(responseText, pendingSensitiveTools);
 
-        if (requestApproval) {
+        const settings = StorageService.getSettings();
+        if (settings.autoApproveSensitive) {
+          onUpdate({
+            type: "executing_tools",
+            message: "Executando ferramentas sensíveis (Aprovação Automática ativa)...",
+            toolCalls: toolStates,
+          });
+        } else if (requestApproval) {
           const pendingApproval = this.createPendingApproval({
             sessionId,
             provider,

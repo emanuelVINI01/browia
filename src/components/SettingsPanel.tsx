@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { KeyRound, Languages, MessageSquareText, Settings, Sparkles } from "lucide-react";
-import { motion } from "framer-motion";
+import { KeyRound, Languages, MessageSquareText, Settings, Sparkles, ShieldAlert } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
 import { useI18n } from "../i18n";
 import {
   type AiProvider,
@@ -15,6 +15,7 @@ import {
   LanguageSettingsSection,
   ModelSettingsSection,
   PromptSettingsSection,
+  GeneralSettingsSection,
 } from "./settings/SettingsSections";
 
 interface SettingsPanelProps {
@@ -25,7 +26,7 @@ interface SettingsPanelProps {
   onModelChange: (model: string) => void;
 }
 
-type SettingsTab = "api" | "google" | "language" | "prompt";
+type SettingsTab = "api" | "google" | "general" | "language" | "prompt";
 
 export function SettingsPanel({
   onClose,
@@ -42,16 +43,18 @@ export function SettingsPanel({
   const [customModel, setCustomModel] = useState(() => (isKnownModel(provider, model, []) ? "" : model));
   const [isCustomModelActive, setIsCustomModelActive] = useState(() => !isKnownModel(provider, model, []));
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
+  const [isWarningModalOpen, setIsWarningModalOpen] = useState(false);
 
   const tabs = useMemo<SettingsTabItem[]>(() => {
     const providerLabel = provider === "openai" ? "OpenAI" : provider === "gemini" ? "Gemini" : "Ollama";
     return [
       { id: "api", label: t.settings_tab_api, icon: KeyRound },
       { id: "google", label: providerLabel, icon: Sparkles },
+      { id: "general", label: t.settings_tab_general, icon: ShieldAlert },
       { id: "language", label: t.settings_tab_language, icon: Languages },
       { id: "prompt", label: t.settings_tab_prompt, icon: MessageSquareText },
     ];
-  }, [t.settings_tab_api, t.settings_tab_language, t.settings_tab_prompt, provider]);
+  }, [t.settings_tab_api, t.settings_tab_general, t.settings_tab_language, t.settings_tab_prompt, provider]);
 
   const fetchOllamaModels = useCallback(async (endpoint: string) => {
     setLoadingOllama(true);
@@ -104,6 +107,16 @@ export function SettingsPanel({
     }
   };
 
+  const handleConfirmWarning = () => {
+    setSettings((current) => ({ ...current, autoApproveSensitive: true }));
+    setIsWarningModalOpen(false);
+  };
+
+  const handleCancelWarning = () => {
+    setSettings((current) => ({ ...current, autoApproveSensitive: false }));
+    setIsWarningModalOpen(false);
+  };
+
   const handleSaveSettings = () => {
     StorageService.saveSettings(settings);
 
@@ -128,7 +141,7 @@ export function SettingsPanel({
       animate={{ scale: 1, opacity: 1, y: 0 }}
       exit={{ scale: 0.95, opacity: 0, y: 15 }}
       transition={{ duration: 0.2, ease: "easeOut" }}
-      className="glass-surface flex max-h-[86vh] w-full max-w-3xl flex-col gap-4 overflow-hidden rounded-xl border border-[var(--theme-border)] p-5 text-[var(--theme-text)]"
+      className="glass-surface flex max-h-[86vh] w-full max-w-3xl flex-col gap-4 overflow-hidden rounded-xl border border-[var(--theme-border)] p-5 text-[var(--theme-text)] relative"
     >
       <div className="flex items-center justify-between border-b border-[var(--theme-border)] pb-3">
         <h2 className="flex items-center gap-2 text-xl font-display font-semibold text-[var(--theme-primary)]">
@@ -189,6 +202,14 @@ export function SettingsPanel({
             />
           )}
 
+          {activeTab === "general" && (
+            <GeneralSettingsSection
+              settings={settings}
+              setSettings={setSettings}
+              onShowWarning={() => setIsWarningModalOpen(true)}
+            />
+          )}
+
           {activeTab === "language" && (
             <LanguageSettingsSection settings={settings} setSettings={setSettings} />
           )}
@@ -206,6 +227,54 @@ export function SettingsPanel({
       >
         {t.settings_save_button}
       </button>
+
+      <AnimatePresence>
+        {isWarningModalOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 bg-black/85 backdrop-blur-md z-[60] flex items-center justify-center p-6"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 10 }}
+              className="theme-card max-w-md w-full p-6 border border-[var(--theme-danger)]/40 bg-[var(--theme-surface)] shadow-[0_0_50px_rgba(215,78,53,0.15)] flex flex-col gap-4"
+            >
+              <h3 className="text-lg font-display font-extrabold text-[var(--theme-danger)] flex items-center gap-2">
+                <ShieldAlert className="h-6 w-6 text-[var(--theme-danger)] animate-pulse" />
+                {t.auto_approve_modal_title}
+              </h3>
+              
+              <p className="text-sm font-medium text-[var(--theme-text)] leading-relaxed">
+                {t.auto_approve_modal_warning}
+              </p>
+              
+              <div className="bg-black/30 p-3 rounded-lg border border-[var(--theme-border)] font-sans text-xs text-[var(--theme-muted)] whitespace-pre-line leading-relaxed">
+                {t.auto_approve_modal_risk_list}
+              </div>
+              
+              <div className="flex flex-col sm:flex-row gap-2 mt-2">
+                <button
+                  type="button"
+                  onClick={handleConfirmWarning}
+                  className="flex-1 py-2 px-3 rounded-lg bg-[var(--theme-danger)] hover:bg-[var(--theme-danger)]/90 text-white font-bold text-xs transition-colors cursor-pointer"
+                >
+                  {t.auto_approve_modal_confirm}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCancelWarning}
+                  className="py-2 px-3 rounded-lg theme-secondary-button font-bold text-xs transition-colors cursor-pointer"
+                >
+                  {t.auto_approve_modal_cancel}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </motion.div>
   );
 }

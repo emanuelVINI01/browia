@@ -29,6 +29,7 @@ export interface AppSettings {
   ollamaEndpoint: string;
   customSystemPrompt: string;
   language?: string;
+  autoApproveSensitive?: boolean;
 }
 
 export interface PendingToolCall {
@@ -90,6 +91,7 @@ export class StorageService {
       ollamaEndpoint: "http://localhost:11434",
       customSystemPrompt: "",
       language: "browser",
+      autoApproveSensitive: false,
     };
 
     if (!data) return defaultSettings;
