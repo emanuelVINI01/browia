@@ -1,0 +1,30 @@
+{
+    "manifest_version": 3,
+    "name": "Agente IA Extensão",
+    "version": "1.0",
+    "description": "Controlador de abas com React e IA",
+    "permissions": [
+        "activeTab",
+        "scripting",
+        "storage",
+        "tabs",
+        "downloads",
+        "cookies",
+        "bookmarks",
+        "history",
+        "clipboardRead",
+        "clipboardWrite",
+        "offscreen",
+        "declarativeNetRequest"
+    ],
+    "host_permissions": [
+        "<all_urls>"
+    ],
+    "background": {
+        "service_worker": "assets/background.js",
+        "type": "module"
+    },
+    "action": {
+        "default_popup": "index.html"
+    }
+}
