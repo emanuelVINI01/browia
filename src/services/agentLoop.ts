@@ -406,52 +406,6 @@ export class AgentLoop {
         continue;
       }
 
-      const suggestedRecoveryTool = this.getSuggestedRecoveryTool(executedStepsAtIterationStart);
-      const ignoresSuggestedRecovery = suggestedRecoveryTool
-        && !toolCalls.some((call) => call.name === suggestedRecoveryTool.name)
-        && toolCalls.some((call) => this.isMutatingTool(call.name));
-
-      if (suggestedRecoveryTool && ignoresSuggestedRecovery) {
-        this.logDebug({
-          sessionId,
-          provider,
-          model,
-          phase: "suggested_tool_recovery",
-          message: `Executando ${suggestedRecoveryTool.name} sugerida por falha anterior antes de nova ação.`,
-          data: {
-            iteration: iter + 1,
-            suggestedRecoveryTool,
-            blockedTools: toolCalls.map((call) => call.name),
-          },
-        });
-
-        const recoveryResponse = `<execution_plan>Buscar o elemento correto sugerido pela falha anterior antes de tentar nova interação.</execution_plan>\n${this.renderToolCallXml(suggestedRecoveryTool)}`;
-        const recoveryStates: ToolCallState[] = [{
-          name: suggestedRecoveryTool.name,
-          params: suggestedRecoveryTool.params,
-          status: "pending",
-        }];
-        const recoverySteps = await this.executeApprovedToolCalls(
-          sessionId,
-          recoveryResponse,
-          [suggestedRecoveryTool],
-          recoveryStates,
-          onUpdate,
-          budgetManager,
-          activeTabUrl,
-          signal,
-          { recordAssistantMessage: true },
-        );
-        this.appendInternalContinuationPrompt(
-          sessionId,
-          originalUserRequest,
-          [...executedStepsAtIterationStart, ...recoverySteps],
-          `A ferramenta anterior sugeriu ${suggestedRecoveryTool.name}; o runtime executou essa busca antes de permitir nova interação.`,
-          responseText,
-        );
-        continue;
-      }
-
       if (toolCalls.length === 0) {
         const cleanedResponse = responseText.trim();
 
@@ -940,49 +894,6 @@ export class AgentLoop {
     });
   }
 
-  private static getSuggestedRecoveryTool(steps: ExecutedStep[]): ToolCall | null {
-    const lastStep = [...steps].reverse().find((step) => step.status === "error" && step.error);
-
-    if (!lastStep?.error) {
-      return null;
-    }
-
-    try {
-      const parsed = JSON.parse(lastStep.error) as {
-        suggestedNextTool?: unknown;
-        suggestedArgs?: unknown;
-      };
-
-      if (
-        typeof parsed.suggestedNextTool !== "string"
-        || !parsed.suggestedArgs
-        || typeof parsed.suggestedArgs !== "object"
-        || Array.isArray(parsed.suggestedArgs)
-      ) {
-        return null;
-      }
-
-      const allowedRecoveryTools = new Set(["query_elements", "resolve_element", "get_page_inventory"]);
-      if (!allowedRecoveryTools.has(parsed.suggestedNextTool)) {
-        return null;
-      }
-
-      const params: Record<string, string> = {};
-      for (const [key, value] of Object.entries(parsed.suggestedArgs as Record<string, unknown>)) {
-        if (value !== undefined && value !== null) {
-          params[key] = String(value);
-        }
-      }
-
-      return {
-        name: parsed.suggestedNextTool,
-        params,
-      };
-    } catch {
-      return null;
-    }
-  }
-
   private static extractExecutedSteps(messages: Message[]): ExecutedStep[] {
     const steps: ExecutedStep[] = [];
     let pendingCalls: ToolCall[] = [];
@@ -1141,6 +1052,45 @@ export class AgentLoop {
     }
 
     return this.truncateForPrompt(latestRead.result, 1800);
+  }
+
+  private static summarizeResolvedElementsForPrompt(steps: ExecutedStep[]): string {
+    const lines: string[] = [];
+
+    for (const step of steps.slice(-20)) {
+      if (step.status !== "success" || !step.result || !["resolve_element", "query_elements"].includes(step.tool)) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(step.result) as {
+          element?: Record<string, unknown>;
+          candidates?: Array<Record<string, unknown>>;
+        } | Array<Record<string, unknown>>;
+        const records = Array.isArray(parsed)
+          ? parsed.slice(0, 3)
+          : [parsed.element, ...(parsed.candidates ?? []).slice(0, 2)].filter(Boolean) as Array<Record<string, unknown>>;
+
+        for (const record of records) {
+          const vortexId = record.vortexId;
+          if (vortexId === undefined || vortexId === null) {
+            continue;
+          }
+
+          const label = [
+            record.id ? `id=${record.id}` : "",
+            record.role ? `role=${record.role}` : "",
+            record.ariaLabel ? `aria=${record.ariaLabel}` : "",
+            record.placeholder ? `placeholder=${record.placeholder}` : "",
+          ].filter(Boolean).join(", ");
+          lines.push(`- ${step.tool}: vortexId=${vortexId}, tag=${record.tag ?? "?"}${label ? `, ${label}` : ""}`);
+        }
+      } catch {
+        // Ignore malformed tool result snapshots.
+      }
+    }
+
+    return [...new Set(lines)].slice(-8).join("\n") || "Nenhum elemento resolvido ainda.";
   }
 
   private static truncateForPrompt(value: string, maxChars: number): string {
@@ -1575,6 +1525,8 @@ Título atual: ${activeTabTitle || "Não detectado"}
 Estatísticas de Consumo: Requests=${budgetStats?.requestCount ?? 0}, Tokens estimados=${budgetStats?.totalTokens ?? 0}
 Passos executados até agora:
 ${executedSteps.length > 0 ? executedSteps.map((s, i) => `${i+1}. Tool: ${s.tool} -> status: ${s.status}${s.error ? ` (Erro: ${s.error})` : ""}`).join("\n") : "Nenhum passo executado ainda."}
+Elementos resolvidos recentemente:
+${this.summarizeResolvedElementsForPrompt(executedSteps)}
 ${recipePrompt}
 ${warningPrompt}
 `;

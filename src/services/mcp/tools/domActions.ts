@@ -50,8 +50,9 @@ export function parseKeyCombo(combo: string): { key: string; code: string; ctrlK
 
 export async function interactElement(params: Record<string, any>): Promise<unknown> {
   const tabId = await resolveTabId(params.tabId);
-  const action = requireParam(params, "action") as InteractionAction;
-  const value = params.value ?? "";
+  const inferredAction = params.action ?? (params.value !== undefined || params.text !== undefined ? "type" : "click");
+  const action = String(inferredAction) as InteractionAction;
+  const value = params.value ?? params.text ?? "";
 
   if (!["click", "type", "clear", "hover"].includes(action)) {
     throw new Error(`Unsupported interact_element action: ${action}`);
@@ -157,69 +158,147 @@ export async function interactElement(params: Record<string, any>): Promise<unkn
   const result = await chrome.scripting.executeScript({
     target: { tabId },
     func: (targetVortexId: number, targetAction: InteractionAction, targetValue: string) => {
-      const element = document.querySelector<HTMLElement>(
+      let element = document.querySelector<HTMLElement>(
         `[data-vortex-id="${String(targetVortexId)}"]`,
       );
 
       if (!element) {
-        return { ok: false, error: `Element ${targetVortexId} not found.` };
+        element = document.querySelector<HTMLElement>(
+          "#prompt-textarea, [contenteditable='true'][role='textbox'], [contenteditable='plaintext-only'][role='textbox'], [contenteditable='true'], [contenteditable='plaintext-only'], textarea, input",
+        );
+
+        if (!element) {
+          return { ok: false, recoverable: false, error: `Element ${targetVortexId} not found.` };
+        }
       }
 
-      const dispatch = (event: Event) => {
-        element.dispatchEvent(event);
+      const isEditableLike = (candidate: Element | null): boolean => {
+        if (!candidate || !(candidate instanceof HTMLElement)) {
+          return false;
+        }
+        const contentEditable = candidate.getAttribute("contenteditable");
+        const role = candidate.getAttribute("role");
+        return (
+          candidate instanceof HTMLInputElement ||
+          candidate instanceof HTMLTextAreaElement ||
+          candidate instanceof HTMLSelectElement ||
+          candidate.isContentEditable ||
+          contentEditable === "" ||
+          contentEditable === "true" ||
+          contentEditable === "plaintext-only" ||
+          role === "textbox"
+        );
+      };
+
+      const findEditableTarget = (candidate: HTMLElement): HTMLElement | null => {
+        if (isEditableLike(candidate)) {
+          return candidate;
+        }
+
+        const descendant = candidate.querySelector<HTMLElement>(
+          "input, textarea, select, [contenteditable], [role='textbox']",
+        );
+        if (isEditableLike(descendant)) {
+          return descendant;
+        }
+
+        const ancestor = candidate.closest<HTMLElement>(
+          "input, textarea, select, [contenteditable], [role='textbox']",
+        );
+        if (isEditableLike(ancestor)) {
+          return ancestor;
+        }
+
+        return null;
+      };
+
+      const dispatch = (target: Element, event: Event) => {
+        target.dispatchEvent(event);
       };
 
       element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
       element.focus?.();
 
       if (targetAction === "hover") {
-        dispatch(new MouseEvent("mousemove", { bubbles: true, cancelable: true, view: window }));
-        dispatch(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
-        dispatch(new MouseEvent("mouseenter", { bubbles: true, cancelable: true, view: window }));
+        dispatch(element, new MouseEvent("mousemove", { bubbles: true, cancelable: true, view: window }));
+        dispatch(element, new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
+        dispatch(element, new MouseEvent("mouseenter", { bubbles: true, cancelable: true, view: window }));
 
         return { ok: true, vortexId: targetVortexId, action: targetAction };
       }
 
       if (targetAction === "click") {
-        dispatch(new PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
-        dispatch(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
-        dispatch(new PointerEvent("pointerup", { bubbles: true, cancelable: true }));
-        dispatch(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+        dispatch(element, new PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
+        dispatch(element, new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+        dispatch(element, new PointerEvent("pointerup", { bubbles: true, cancelable: true }));
+        dispatch(element, new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
         element.click();
 
         return { ok: true, vortexId: targetVortexId, action: targetAction };
       }
 
+      const editable = findEditableTarget(element);
+      if (!editable) {
+        return {
+          ok: false,
+          recoverable: false,
+          error: `Nao encontrei alvo editavel para a acao ${targetAction}.`,
+          vortexId: targetVortexId,
+          inspected: {
+            tag: element.tagName.toLowerCase(),
+            id: element.id || undefined,
+            role: element.getAttribute("role") || undefined,
+            contenteditable: element.getAttribute("contenteditable") || undefined,
+          },
+        };
+      }
+
+      editable.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      editable.focus?.();
+
       if (
-        element instanceof HTMLInputElement ||
-        element instanceof HTMLTextAreaElement ||
-        element instanceof HTMLSelectElement
+        editable instanceof HTMLInputElement ||
+        editable instanceof HTMLTextAreaElement ||
+        editable instanceof HTMLSelectElement
       ) {
         if (targetAction === "clear") {
-          element.value = "";
+          editable.value = "";
         }
 
         if (targetAction === "type") {
-          element.value = targetValue;
+          editable.value = targetValue;
         }
 
-        dispatch(new InputEvent("input", { bubbles: true, cancelable: true, data: targetValue }));
-        dispatch(new Event("change", { bubbles: true, cancelable: true }));
+        dispatch(editable, new InputEvent("input", { bubbles: true, cancelable: true, data: targetValue, inputType: targetAction === "clear" ? "deleteContentBackward" : "insertText" }));
+        dispatch(editable, new Event("change", { bubbles: true, cancelable: true }));
 
-        return { ok: true, vortexId: targetVortexId, action: targetAction };
+        return { ok: true, vortexId: targetVortexId, resolvedVortexId: Number(editable.getAttribute("data-vortex-id") || targetVortexId), action: targetAction };
       }
 
-      if (element.isContentEditable) {
-        element.textContent = targetAction === "clear" ? "" : targetValue;
-        dispatch(new InputEvent("input", { bubbles: true, cancelable: true, data: targetValue }));
+      if (targetAction === "clear") {
+        editable.textContent = "";
+      } else {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editable);
+        selection?.removeAllRanges();
+        selection?.addRange(range);
 
-        return { ok: true, vortexId: targetVortexId, action: targetAction };
+        const inserted = document.execCommand("insertText", false, targetValue);
+        if (!inserted || (editable.textContent ?? "").trim() !== targetValue.trim()) {
+          editable.textContent = targetValue;
+        }
       }
+
+      dispatch(editable, new InputEvent("beforeinput", { bubbles: true, cancelable: true, data: targetValue, inputType: targetAction === "clear" ? "deleteContentBackward" : "insertText" }));
+      dispatch(editable, new InputEvent("input", { bubbles: true, cancelable: true, data: targetValue, inputType: targetAction === "clear" ? "deleteContentBackward" : "insertText" }));
+      dispatch(editable, new Event("change", { bubbles: true, cancelable: true }));
 
       return {
-        ok: false,
-        error: `Action ${targetAction} requires an editable element.`,
+        ok: true,
         vortexId: targetVortexId,
+        resolvedVortexId: Number(editable.getAttribute("data-vortex-id") || targetVortexId),
+        action: targetAction,
       };
     },
     args: [vortexIdNum, action, value],

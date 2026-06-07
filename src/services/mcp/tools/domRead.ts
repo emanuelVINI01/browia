@@ -98,6 +98,7 @@ export async function getDomTree(params: Record<string, string>): Promise<DomSem
           return (
             ["input", "textarea", "select", "button", "a"].includes(tag) ||
             contentEditable === "true" ||
+            contentEditable === "plaintext-only" ||
             contentEditable === "" ||
             ["button", "link", "checkbox", "textbox"].includes(role || "")
           );
@@ -375,6 +376,13 @@ export interface ResolveElementInput {
   tag?: string;
   name?: string;
   nameContains?: string;
+  attributeName?: string;
+  attributeValue?: string;
+  attributeContains?: string;
+  propertyName?: string;
+  propertyValue?: string;
+  propertyContains?: string;
+  contentEditable?: string;
   placeholder?: string;
   placeholderContains?: string;
   visibleOnly?: boolean;
@@ -397,6 +405,13 @@ export async function resolveElement(params: Record<string, string>): Promise<un
     tag: params.tag,
     name: params.name,
     nameContains: params.nameContains,
+    attributeName: params.attributeName ?? params.attrName,
+    attributeValue: params.attributeValue ?? params.attrValue,
+    attributeContains: params.attributeContains ?? params.attrContains,
+    propertyName: params.propertyName ?? params.propName,
+    propertyValue: params.propertyValue ?? params.propValue,
+    propertyContains: params.propertyContains ?? params.propContains,
+    contentEditable: params.contentEditable ?? params.contenteditable,
     placeholder: params.placeholder,
     placeholderContains: params.placeholderContains,
     visibleOnly: params.visibleOnly !== "false",
@@ -444,6 +459,7 @@ export async function resolveElement(params: Record<string, string>): Promise<un
         return (
           ["input", "textarea", "select", "button", "a"].includes(tag) ||
           contentEditable === "true" ||
+          contentEditable === "plaintext-only" ||
           contentEditable === "" ||
           ["button", "link", "checkbox", "textbox"].includes(roleStr || "")
         );
@@ -542,6 +558,7 @@ export async function resolveElement(params: Record<string, string>): Promise<un
         const textVal = inp.text || inp.textContains ? (el.textContent || "").trim() : "";
         const placeholderAttr = el.getAttribute("placeholder") || "";
         const roleAttr = el.getAttribute("role") || "";
+        const contentEditableAttr = el.getAttribute("contenteditable") || "";
 
         if (inp.vortexId && Number(el.getAttribute("data-vortex-id")) === Number(inp.vortexId)) {
           score += 500;
@@ -583,6 +600,32 @@ export async function resolveElement(params: Record<string, string>): Promise<un
           score += 20;
         }
 
+        if (inp.attributeName) {
+          const attr = el.getAttribute(inp.attributeName);
+          if (attr !== null && inp.attributeValue && attr.toLowerCase() === inp.attributeValue.toLowerCase()) {
+            score += 85;
+          } else if (attr !== null && inp.attributeContains && attr.toLowerCase().includes(inp.attributeContains.toLowerCase())) {
+            score += 45;
+          } else if (attr !== null && !inp.attributeValue && !inp.attributeContains) {
+            score += 25;
+          }
+        }
+
+        if (inp.propertyName) {
+          const prop = String((el as unknown as Record<string, unknown>)[inp.propertyName] ?? "");
+          if (inp.propertyValue && prop.toLowerCase() === inp.propertyValue.toLowerCase()) {
+            score += 75;
+          } else if (inp.propertyContains && prop.toLowerCase().includes(inp.propertyContains.toLowerCase())) {
+            score += 35;
+          } else if (prop && !inp.propertyValue && !inp.propertyContains) {
+            score += 20;
+          }
+        }
+
+        if (inp.contentEditable && contentEditableAttr.toLowerCase() === inp.contentEditable.toLowerCase()) {
+          score += 60;
+        }
+
         if (inp.role && roleAttr.toLowerCase() === inp.role.toLowerCase()) {
           score += 15;
         }
@@ -594,7 +637,7 @@ export async function resolveElement(params: Record<string, string>): Promise<un
       });
 
       let matches = scored.filter(s => s.score > 0);
-      if (matches.length === 0 && !inp.selector && !inp.id && !inp.ariaLabel && !inp.ariaContains && !inp.text && !inp.textContains && !inp.placeholder && !inp.placeholderContains && !inp.name && !inp.nameContains && !inp.role && !inp.tag) {
+      if (matches.length === 0 && !inp.selector && !inp.id && !inp.ariaLabel && !inp.ariaContains && !inp.text && !inp.textContains && !inp.placeholder && !inp.placeholderContains && !inp.name && !inp.nameContains && !inp.attributeName && !inp.propertyName && !inp.contentEditable && !inp.role && !inp.tag) {
         matches = scored.map(s => ({
           element: s.element,
           score: isInteractive(s.element) ? 10 : 1
