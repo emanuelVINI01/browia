@@ -8,8 +8,29 @@ import {
   type AgentRuntimeState,
   type PendingApproval,
 } from "./services/storageService";
+import type { AiProvider } from "./config/aiModels";
 
-type Provider = "openai" | "gemini" | "ollama";
+type Provider = AiProvider;
+
+function getContextInfo(): string {
+  const hasTabs = typeof chrome !== "undefined" && typeof chrome.tabs !== "undefined";
+  const hasScripting = typeof chrome !== "undefined" && typeof chrome.scripting !== "undefined";
+  
+  let context: string;
+  if (typeof window !== "undefined") {
+    if (window.location.pathname.includes("offscreen")) {
+      context = "offscreen";
+    } else {
+      context = "sidepanel/popup";
+    }
+  } else {
+    context = "background/service-worker";
+  }
+  
+  return `Context: ${context}, chrome.tabs available: ${hasTabs}, chrome.scripting available: ${hasScripting}`;
+}
+
+console.log("[Browia Offscreen Startup]", getContextInfo());
 
 interface OffscreenStartMessage {
   target: "offscreen";
@@ -322,8 +343,17 @@ async function cancelAgent(sessionId: string): Promise<AgentRuntimeState> {
 }
 
 function updateRuntime(state: Omit<AgentRuntimeState, "updatedAt">): void {
+  const previous = StorageService.getAgentRuntimeState();
+  const sameSession = previous.sessionId === state.sessionId;
+  const isFreshStart = state.status === "running" && state.message.includes("Iniciando agente");
+  const toolCalls = state.toolCalls.length > 0 || !sameSession || isFreshStart
+    ? state.toolCalls
+    : previous.toolCalls;
+
   StorageService.saveAgentRuntimeState({
     ...state,
+    toolCalls,
+    budgetStats: state.budgetStats ?? (sameSession ? previous.budgetStats : undefined),
     updatedAt: new Date().toISOString(),
   });
 

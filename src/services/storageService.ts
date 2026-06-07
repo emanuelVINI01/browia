@@ -1,3 +1,5 @@
+import type { AiProvider } from "../config/aiModels";
+
 export interface Message {
   id: string;
   role: "user" | "assistant" | "system" | "tool";
@@ -16,7 +18,7 @@ export interface Message {
 export interface Session {
   id: string;
   title: string;
-  provider: "openai" | "gemini" | "ollama";
+  provider: AiProvider;
   model: string;
   messages: Message[];
   createdAt: string;
@@ -26,10 +28,12 @@ export interface Session {
 export interface AppSettings {
   openaiApiKey: string;
   geminiApiKey: string;
+  groqApiKey: string;
   ollamaEndpoint: string;
   customSystemPrompt: string;
   language?: string;
   autoApproveSensitive?: boolean;
+  devModeEnabled?: boolean;
 }
 
 export interface PendingToolCall {
@@ -49,13 +53,20 @@ export interface PendingExecutionPlan {
 export interface PendingApproval {
   id: string;
   sessionId: string;
-  provider: "openai" | "gemini" | "ollama";
+  provider: AiProvider;
   model: string;
   responseText: string;
   plan: PendingExecutionPlan;
   toolCalls: PendingToolCall[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface PendingAgentIntervention {
+  id: string;
+  sessionId: string;
+  content: string;
+  createdAt: string;
 }
 
 export interface AgentRuntimeState {
@@ -70,6 +81,43 @@ export interface AgentRuntimeState {
     status: "pending" | "success" | "error";
   }>;
   updatedAt: string;
+  budgetStats?: {
+    totalTokens: number;
+    requestCount: number;
+    maxTokens: number;
+    rawSize: number;
+    compressedSize: number;
+    compressionRatio: number;
+    lastCompressedTool: string;
+    lastInputTokens?: number;
+    lastOutputTokens?: number;
+    lastTokensPerSecond?: number;
+    callHistory?: Array<{
+      sequence: number;
+      kind: "provider" | "tool_result";
+      provider?: AiProvider;
+      model?: string;
+      iteration?: number;
+      toolName?: string;
+      inputTokens?: number;
+      outputTokens: number;
+      totalTokens: number;
+      tokensPerSecond?: number;
+      estimated?: boolean;
+      timestamp: string;
+    }>;
+  };
+}
+
+export interface AgentDebugEvent {
+  id: string;
+  sessionId: string;
+  provider: AiProvider;
+  model: string;
+  phase: string;
+  message: string;
+  data?: Record<string, unknown>;
+  createdAt: string;
 }
 
 const STORAGE_KEYS = {
@@ -79,7 +127,9 @@ const STORAGE_KEYS = {
   SELECTED_PROVIDER: "browia_selected_provider",
   SELECTED_MODEL: "browia_selected_model",
   PENDING_APPROVALS: "browia_pending_approvals",
+  PENDING_AGENT_INTERVENTIONS: "browia_pending_agent_interventions",
   AGENT_RUNTIME_STATE: "browia_agent_runtime_state",
+  AGENT_DEBUG_EVENTS: "browia_agent_debug_events",
 };
 
 export class StorageService {
@@ -88,10 +138,12 @@ export class StorageService {
     const defaultSettings: AppSettings = {
       openaiApiKey: "",
       geminiApiKey: "",
+      groqApiKey: "",
       ollamaEndpoint: "http://localhost:11434",
       customSystemPrompt: "",
       language: "browser",
       autoApproveSensitive: false,
+      devModeEnabled: false,
     };
 
     if (!data) return defaultSettings;
@@ -106,27 +158,30 @@ export class StorageService {
     localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
   }
 
-  static getSelectedProvider(): "openai" | "gemini" | "ollama" {
+  static getSelectedProvider(): AiProvider {
     const provider = localStorage.getItem(STORAGE_KEYS.SELECTED_PROVIDER);
-    return (provider as "openai" | "gemini" | "ollama") || "openai";
+    if (provider === "openai" || provider === "gemini" || provider === "groq" || provider === "ollama") {
+      return provider;
+    }
+    return "openai";
   }
 
-  static saveSelectedProvider(provider: "openai" | "gemini" | "ollama"): void {
+  static saveSelectedProvider(provider: AiProvider): void {
     localStorage.setItem(STORAGE_KEYS.SELECTED_PROVIDER, provider);
   }
 
-  static getSelectedModel(provider: "openai" | "gemini" | "ollama"): string {
+  static getSelectedModel(provider: AiProvider): string {
     const key = `${STORAGE_KEYS.SELECTED_MODEL}_${provider}`;
     const model = localStorage.getItem(key);
     if (model) return model;
 
-    // Default models
     if (provider === "openai") return "gpt-4o-mini";
     if (provider === "gemini") return "gemma-4-26b-a4b-it";
+    if (provider === "groq") return "meta-llama/llama-4-scout-17b-16e-instruct";
     return "llama3";
   }
 
-  static saveSelectedModel(provider: "openai" | "gemini" | "ollama", model: string): void {
+  static saveSelectedModel(provider: AiProvider, model: string): void {
     const key = `${STORAGE_KEYS.SELECTED_MODEL}_${provider}`;
     localStorage.setItem(key, model);
   }
@@ -163,7 +218,7 @@ export class StorageService {
     this.saveSessions(sessions);
   }
 
-  static createSession(provider: "openai" | "gemini" | "ollama", model: string, titlePrefix: string = "Session"): Session {
+  static createSession(provider: AiProvider, model: string, titlePrefix: string = "Session"): Session {
     const newSession: Session = {
       id: crypto.randomUUID(),
       title: `${titlePrefix} ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
@@ -246,6 +301,65 @@ export class StorageService {
     localStorage.setItem(STORAGE_KEYS.PENDING_APPROVALS, JSON.stringify(approvals));
   }
 
+  static getPendingAgentInterventions(sessionId: string | null): PendingAgentIntervention[] {
+    if (!sessionId) {
+      return [];
+    }
+
+    const data = localStorage.getItem(STORAGE_KEYS.PENDING_AGENT_INTERVENTIONS);
+    if (!data) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(data) as Record<string, PendingAgentIntervention[]>;
+      return parsed[sessionId] ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  static queueAgentIntervention(sessionId: string, content: string): PendingAgentIntervention {
+    const data = localStorage.getItem(STORAGE_KEYS.PENDING_AGENT_INTERVENTIONS);
+    let queued: Record<string, PendingAgentIntervention[]> = {};
+
+    if (data) {
+      try {
+        queued = JSON.parse(data) as Record<string, PendingAgentIntervention[]>;
+      } catch {
+        queued = {};
+      }
+    }
+
+    const intervention: PendingAgentIntervention = {
+      id: crypto.randomUUID(),
+      sessionId,
+      content,
+      createdAt: new Date().toISOString(),
+    };
+
+    queued[sessionId] = [...(queued[sessionId] ?? []), intervention].slice(-5);
+    localStorage.setItem(STORAGE_KEYS.PENDING_AGENT_INTERVENTIONS, JSON.stringify(queued));
+    return intervention;
+  }
+
+  static consumePendingAgentInterventions(sessionId: string): PendingAgentIntervention[] {
+    const data = localStorage.getItem(STORAGE_KEYS.PENDING_AGENT_INTERVENTIONS);
+    if (!data) {
+      return [];
+    }
+
+    try {
+      const queued = JSON.parse(data) as Record<string, PendingAgentIntervention[]>;
+      const interventions = queued[sessionId] ?? [];
+      delete queued[sessionId];
+      localStorage.setItem(STORAGE_KEYS.PENDING_AGENT_INTERVENTIONS, JSON.stringify(queued));
+      return interventions;
+    } catch {
+      return [];
+    }
+  }
+
   static getAgentRuntimeState(): AgentRuntimeState {
     const data = localStorage.getItem(STORAGE_KEYS.AGENT_RUNTIME_STATE);
     const defaultState: AgentRuntimeState = {
@@ -285,5 +399,40 @@ export class StorageService {
       toolCalls: [],
       updatedAt: new Date().toISOString(),
     });
+  }
+
+  static getAgentDebugEvents(sessionId?: string): AgentDebugEvent[] {
+    const data = localStorage.getItem(STORAGE_KEYS.AGENT_DEBUG_EVENTS);
+
+    if (!data) {
+      return [];
+    }
+
+    try {
+      const events = JSON.parse(data) as AgentDebugEvent[];
+      return sessionId ? events.filter((event) => event.sessionId === sessionId) : events;
+    } catch {
+      return [];
+    }
+  }
+
+  static appendAgentDebugEvent(event: Omit<AgentDebugEvent, "id" | "createdAt">): void {
+    const events = this.getAgentDebugEvents();
+    events.push({
+      ...event,
+      id: crypto.randomUUID(),
+      createdAt: new Date().toISOString(),
+    });
+    localStorage.setItem(STORAGE_KEYS.AGENT_DEBUG_EVENTS, JSON.stringify(events.slice(-300)));
+  }
+
+  static clearAgentDebugEvents(sessionId?: string): void {
+    if (!sessionId) {
+      localStorage.removeItem(STORAGE_KEYS.AGENT_DEBUG_EVENTS);
+      return;
+    }
+
+    const events = this.getAgentDebugEvents().filter((event) => event.sessionId !== sessionId);
+    localStorage.setItem(STORAGE_KEYS.AGENT_DEBUG_EVENTS, JSON.stringify(events));
   }
 }

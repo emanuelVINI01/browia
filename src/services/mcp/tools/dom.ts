@@ -3,7 +3,7 @@ import { domActionTools } from "./domActions";
 import { domReadTools } from "./domRead";
 
 export { alterElementDom, interactElement } from "./domActions";
-export { getDomTree } from "./domRead";
+export { getDomTree, resolveElement } from "./domRead";
 
 export const domTools: ToolRegistry = {
   ...domReadTools,

@@ -3,7 +3,8 @@ export interface ToolCall {
   params: Record<string, string>;
 }
 
-export type ToolHandler = (params: Record<string, string>) => Promise<unknown>;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type ToolHandler = (params: Record<string, any>) => Promise<unknown>;
 export type ToolRegistry = Record<string, ToolHandler>;
 
 export interface PageResource {

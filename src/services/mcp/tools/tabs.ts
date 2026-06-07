@@ -16,6 +16,9 @@ export const tabTools: ToolRegistry = {
 };
 
 async function listTabs(): Promise<Array<{ id?: number; url?: string; title?: string }>> {
+  if (typeof chrome === "undefined" || !chrome.tabs) {
+    throw new Error("chrome.tabs API is not available. If you recently updated the manifest permissions, please reload the extension in chrome://extensions.");
+  }
   const tabs = await chrome.tabs.query({});
 
   return tabs.map((tab) => ({

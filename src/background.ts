@@ -1,5 +1,6 @@
 import { McpEngine, type ToolCall } from "./services/mcpEngine";
 import type { AgentRuntimeState } from "./services/storageService";
+import type { AiProvider } from "./config/aiModels";
 
 function setupOllamaRules() {
   if (typeof chrome !== "undefined" && chrome.declarativeNetRequest) {
@@ -78,7 +79,7 @@ export interface McpExecuteMessage {
 export interface AgentStartMessage {
   type: "AGENT_START";
   payload: {
-    provider: "openai" | "gemini" | "ollama";
+    provider: AiProvider;
     model: string;
     sessionId: string;
   };
@@ -100,13 +101,48 @@ export interface AgentStateChangedMessage {
   payload: AgentRuntimeState;
 }
 
+export interface McpToolCallMessage {
+  type: "MCP_TOOL_CALL";
+  payload: {
+    tool: string;
+    args: Record<string, unknown>;
+    requestId?: string;
+  };
+}
+
+export interface ResolveActiveTabIdMessage {
+  type: "RESOLVE_ACTIVE_TAB_ID";
+}
+
 export type BackgroundMessage =
   | McpRunMessage
   | McpExecuteMessage
+  | McpToolCallMessage
+  | ResolveActiveTabIdMessage
   | AgentStartMessage
   | AgentSessionControlMessage
   | AgentStatusMessage
   | AgentStateChangedMessage;
+
+function getContextInfo(): string {
+  const hasTabs = typeof chrome !== "undefined" && typeof chrome.tabs !== "undefined";
+  const hasScripting = typeof chrome !== "undefined" && typeof chrome.scripting !== "undefined";
+  
+  let context: string;
+  if (typeof window !== "undefined") {
+    if (window.location.pathname.includes("offscreen")) {
+      context = "offscreen";
+    } else {
+      context = "sidepanel/popup";
+    }
+  } else {
+    context = "background/service-worker";
+  }
+  
+  return `Context: ${context}, chrome.tabs available: ${hasTabs}, chrome.scripting available: ${hasScripting}`;
+}
+
+console.log("[Browia Background Startup]", getContextInfo());
 
 chrome.runtime.onMessage.addListener((message: BackgroundMessage, _sender, sendResponse) => {
   if ((message as { target?: string }).target === "offscreen") {
@@ -174,6 +210,34 @@ async function handleMessage(message: BackgroundMessage): Promise<unknown> {
       target: "offscreen",
       type: "OFFSCREEN_AGENT_STATUS",
     });
+  }
+
+  if (message.type === "MCP_TOOL_CALL") {
+    try {
+      const result = await McpEngine.executeTool({
+        name: message.payload.tool,
+        params: message.payload.args as Record<string, string>
+      });
+      return { ok: true, result };
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: errMsg };
+    }
+  }
+
+  if (message.type === "RESOLVE_ACTIVE_TAB_ID") {
+    let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!tabs || tabs.length === 0) {
+      tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    }
+    if (!tabs || tabs.length === 0) {
+      tabs = await chrome.tabs.query({ active: true });
+    }
+    const activeTabId = tabs?.[0]?.id;
+    if (typeof activeTabId !== "number") {
+      throw new Error("No active tab found by background service worker.");
+    }
+    return { ok: true, tabId: activeTabId };
   }
 
   if (message.type === "MCP_EXECUTE") {

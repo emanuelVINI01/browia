@@ -48,7 +48,7 @@ export class OllamaService {
     model: string,
     systemPrompt: string,
     history: Message[]
-  ): Promise<string> {
+  ): Promise<{ text: string; inputTokens?: number; outputTokens?: number }> {
     const baseUrl = this.cleanEndpoint(endpoint);
     const messages = [
       { role: "system", content: systemPrompt },
@@ -81,6 +81,10 @@ export class OllamaService {
     }
 
     const data = await response.json();
-    return data.message?.content || "";
+    return {
+      text: data.message?.content || "",
+      inputTokens: data.prompt_eval_count,
+      outputTokens: data.eval_count,
+    };
   }
 }

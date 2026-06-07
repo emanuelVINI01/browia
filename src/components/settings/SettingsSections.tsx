@@ -6,6 +6,7 @@ import {
   type AiProvider,
   geminiModels,
   getDefaultModel,
+  groqModels,
   openAiModels,
 } from "../../config/aiModels";
 
@@ -58,8 +59,8 @@ export function ApiSettingsSection({
         <label className="text-xs font-semibold uppercase tracking-wider text-[var(--theme-muted)]">
           {t.settings_provider_label}
         </label>
-        <div className="grid grid-cols-3 gap-2">
-          {(["openai", "gemini", "ollama"] as const).map((item) => (
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {(["openai", "gemini", "groq", "ollama"] as const).map((item) => (
             <button
               key={item}
               type="button"
@@ -70,7 +71,7 @@ export function ApiSettingsSection({
                   : "border-transparent bg-[var(--theme-surface-2)] text-[var(--theme-muted)] hover:bg-[rgba(255,255,255,0.05)]"
               }`}
             >
-              {item === "openai" ? "OpenAI" : item === "gemini" ? "Google" : "Ollama"}
+              {getProviderLabel(item)}
             </button>
           ))}
         </div>
@@ -95,6 +96,17 @@ export function ApiSettingsSection({
           placeholder="AIzaSy..."
           value={settings.geminiApiKey}
           onChange={(value) => setSettings((current) => ({ ...current, geminiApiKey: value }))}
+        />
+      )}
+
+      {provider === "groq" && (
+        <LabeledInput
+          icon={Key}
+          label={t.settings_groq_key}
+          type="password"
+          placeholder="gsk_..."
+          value={settings.groqApiKey}
+          onChange={(value) => setSettings((current) => ({ ...current, groqApiKey: value }))}
         />
       )}
 
@@ -140,11 +152,12 @@ export function ModelSettingsSection({
   onToggleCustomModel,
 }: ModelSettingsSectionProps) {
   const { t } = useI18n();
-  const selectedModels = provider === "openai" ? openAiModels : provider === "gemini" ? geminiModels : [];
+  const selectedModels = getPresetModels(provider);
+  const recommendedModels = selectedModels.filter((item) => item.recommended);
 
   return (
     <section className="flex flex-col gap-5">
-      <SectionHeader title={t.settings_google_title} description={t.settings_google_desc} />
+      <SectionHeader title={t.settings_models_title} description={t.settings_models_desc} />
 
       {provider === "gemini" && (
         <div className="rounded-lg border border-[rgba(214,168,79,0.2)] bg-[rgba(214,168,79,0.08)] p-3 text-xs leading-relaxed text-[var(--theme-text)]">
@@ -153,6 +166,16 @@ export function ModelSettingsSection({
             {t.settings_google_quota_title}
           </div>
           <p className="text-[var(--theme-muted)]">{t.settings_google_quota_desc}</p>
+        </div>
+      )}
+
+      {provider === "groq" && (
+        <div className="rounded-lg border border-[rgba(214,168,79,0.2)] bg-[rgba(214,168,79,0.08)] p-3 text-xs leading-relaxed text-[var(--theme-text)]">
+          <div className="mb-1 flex items-center gap-2 font-bold text-[var(--theme-primary-light)]">
+            <Info className="h-3.5 w-3.5" />
+            {t.settings_groq_quota_title}
+          </div>
+          <p className="text-[var(--theme-muted)]">{t.settings_groq_quota_desc}</p>
         </div>
       )}
 
@@ -206,9 +229,9 @@ export function ModelSettingsSection({
         )}
       </div>
 
-      {provider === "gemini" && (
+      {provider !== "ollama" && recommendedModels.length > 0 && (
         <div className="grid gap-2">
-          {geminiModels.filter((item) => item.recommended).map((item) => (
+          {recommendedModels.map((item) => (
             <div
               key={item.id}
               className="flex items-start justify-between gap-3 rounded-lg border border-[var(--theme-border)] bg-[rgba(20,16,10,0.5)] p-3"
@@ -226,6 +249,20 @@ export function ModelSettingsSection({
       )}
     </section>
   );
+}
+
+function getProviderLabel(provider: AiProvider): string {
+  if (provider === "openai") return "OpenAI";
+  if (provider === "gemini") return "Google";
+  if (provider === "groq") return "Groq";
+  return "Ollama";
+}
+
+function getPresetModels(provider: AiProvider) {
+  if (provider === "openai") return openAiModels;
+  if (provider === "gemini") return geminiModels;
+  if (provider === "groq") return groqModels;
+  return [];
 }
 
 export function LanguageSettingsSection({ settings, setSettings }: LanguageSettingsSectionProps) {
@@ -318,6 +355,24 @@ export function GeneralSettingsSection({ settings, setSettings, onShowWarning }:
           </label>
           <span className="text-xs text-[var(--theme-muted)] leading-relaxed select-none">
             {t.settings_general_auto_approve_desc}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex items-start gap-3 rounded-lg border border-[var(--theme-border)] bg-[rgba(20,16,10,0.5)] p-4">
+        <input
+          id="dev-mode-toggle"
+          type="checkbox"
+          checked={Boolean(settings.devModeEnabled)}
+          onChange={(event) => setSettings((current) => ({ ...current, devModeEnabled: event.target.checked }))}
+          className="mt-1 h-4 w-4 cursor-pointer rounded border-[var(--theme-border)] bg-[var(--theme-surface-2)] text-[var(--theme-primary)] focus:ring-[var(--theme-primary)]"
+        />
+        <div className="flex flex-col gap-1">
+          <label htmlFor="dev-mode-toggle" className="cursor-pointer text-sm font-bold text-[var(--theme-primary-light)] select-none">
+            {t.settings_general_dev_mode}
+          </label>
+          <span className="text-xs text-[var(--theme-muted)] leading-relaxed select-none">
+            {t.settings_general_dev_mode_desc}
           </span>
         </div>
       </div>

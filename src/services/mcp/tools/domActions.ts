@@ -1,5 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import type { InteractionAction, ToolRegistry } from "../types";
 import { parseJsonArray, parseJsonObject, requireNumber, requireParam, resolveTabId } from "../utils";
+import { resolveElement } from "./domRead";
 
 export const domActionTools: ToolRegistry = {
   interact_element: interactElement,
@@ -8,14 +10,148 @@ export const domActionTools: ToolRegistry = {
   alter_element_dom: alterElementDom,
 };
 
-export async function interactElement(params: Record<string, string>): Promise<unknown> {
+export function parseKeyCombo(combo: string): { key: string; code: string; ctrlKey: boolean; altKey: boolean; shiftKey: boolean; metaKey: boolean } {
+  const parts = combo.split("+");
+  const key = parts[parts.length - 1];
+  
+  let ctrlKey = false;
+  let altKey = false;
+  let shiftKey = false;
+  let metaKey = false;
+
+  for (let i = 0; i < parts.length - 1; i++) {
+    const mod = parts[i].toLowerCase();
+    if (mod === "ctrl" || mod === "control") ctrlKey = true;
+    if (mod === "alt") altKey = true;
+    if (mod === "shift") shiftKey = true;
+    if (mod === "meta" || mod === "cmd" || mod === "win") metaKey = true;
+  }
+
+  let code = key;
+  if (key.toLowerCase() === "enter") code = "Enter";
+  if (key.toLowerCase() === "escape" || key.toLowerCase() === "esc") code = "Escape";
+  if (key.toLowerCase() === "space") code = "Space";
+  if (key.toLowerCase() === "tab") code = "Tab";
+  if (key.toLowerCase() === "backspace") code = "Backspace";
+  
+  if (key.length === 1 && key.match(/[a-z]/i)) {
+    code = `Key${key.toUpperCase()}`;
+  }
+
+  return {
+    key: key === "Enter" ? "Enter" : key === "Escape" ? "Escape" : key,
+    code,
+    ctrlKey,
+    altKey,
+    shiftKey,
+    metaKey
+  };
+}
+
+export async function interactElement(params: Record<string, any>): Promise<unknown> {
   const tabId = await resolveTabId(params.tabId);
-  const vortexId = requireNumber(params, "vortexId");
   const action = requireParam(params, "action") as InteractionAction;
   const value = params.value ?? "";
 
   if (!["click", "type", "clear", "hover"].includes(action)) {
     throw new Error(`Unsupported interact_element action: ${action}`);
+  }
+
+  const tab = await chrome.tabs.get(tabId);
+  const url = tab.url || "";
+  const domain = new URL(url).hostname.replace("www.", "");
+
+  // Schema validation/conversion (Parte 11)
+  let vortexIdNum: number | undefined = undefined;
+  if (typeof params.vortexId === "number") {
+    vortexIdNum = params.vortexId;
+  } else if (params.vortexId !== undefined && params.vortexId !== "") {
+    if (/^\d+$/.test(String(params.vortexId))) {
+      vortexIdNum = Number(params.vortexId);
+    } else {
+      const vStr = String(params.vortexId).trim();
+      if (vStr.startsWith("#") || vStr.startsWith(".") || vStr.includes("[")) {
+        params.selector = vStr;
+      } else {
+        params.id = vStr;
+      }
+      delete params.vortexId;
+    }
+  }
+
+  // Fallback para chatgpt.com composer (Parte 4)
+  if (vortexIdNum === undefined && domain.includes("chatgpt.com") && action === "type") {
+    const composerLocators = [
+      { selector: "#prompt-textarea" },
+      { id: "prompt-textarea" },
+      { ariaLabel: "Converse com o ChatGPT" },
+      { ariaContains: "ChatGPT", role: "textbox" },
+      { selector: "[contenteditable='true']" }
+    ];
+
+    for (const loc of composerLocators) {
+      const res = (await resolveElement({
+        tabId: String(tabId),
+        ...loc,
+        visibleOnly: "true",
+        interactiveOnly: "true"
+      } as any)) as any;
+
+      if (res && res.success && res.element?.vortexId) {
+        vortexIdNum = res.element.vortexId;
+        break;
+      }
+    }
+  }
+
+  // Resolve locator if needed
+  if (vortexIdNum === undefined && (params.selector || params.id || params.ariaLabel || params.ariaContains || params.textContains || params.role)) {
+    const resolveResult = (await resolveElement({
+      tabId: String(tabId),
+      selector: params.selector ?? "",
+      id: params.id ?? "",
+      ariaLabel: params.ariaLabel ?? "",
+      ariaContains: params.ariaContains ?? "",
+      textContains: params.textContains ?? "",
+      role: params.role ?? "",
+      visibleOnly: "true",
+      interactiveOnly: "true",
+    })) as any;
+
+    if (resolveResult?.success && resolveResult?.element?.vortexId !== undefined) {
+      vortexIdNum = resolveResult.element.vortexId;
+    } else {
+      const isMultiple = resolveResult?.candidates && resolveResult.candidates.length > 1;
+      const suggestedArgs = params.id ? { id: params.id } : params.selector ? { selector: params.selector } : { textContains: params.ariaLabel || params.ariaContains || params.textContains || "" };
+
+      return {
+        success: false,
+        recoverable: true,
+        reason: isMultiple ? "multiple_candidates_found" : "element_not_found",
+        error: resolveResult?.reason || "Could not resolve element for interaction.",
+        candidates: (resolveResult?.candidates || []).slice(0, 5).map((c: any) => ({
+          vortexId: c.vortexId,
+          tag: c.tag,
+          id: c.id,
+          ariaLabel: c.ariaLabel,
+          text: c.text ? c.text.substring(0, 60) : undefined,
+          role: c.role,
+        })),
+        suggestedNextTool: isMultiple ? "resolve_element" : "query_elements",
+        suggestedArgs: isMultiple ? suggestedArgs : { query: params.id || params.selector || params.ariaLabel || params.textContains || "input" }
+      };
+    }
+  }
+
+  if (vortexIdNum === undefined) {
+    return {
+      success: false,
+      recoverable: true,
+      reason: "missing_vortex_id_and_locators",
+      error: "Parameter vortexId must be a number or a valid locator (selector, id, ariaLabel, etc.) must be provided.",
+      suggestedNextTool: "query_elements",
+      suggestedArgs: { query: "input button" }
+    };
   }
 
   const result = await chrome.scripting.executeScript({
@@ -86,7 +222,7 @@ export async function interactElement(params: Record<string, string>): Promise<u
         vortexId: targetVortexId,
       };
     },
-    args: [vortexId, action, value],
+    args: [vortexIdNum, action, value],
   });
 
   return result[0]?.result;
@@ -95,42 +231,39 @@ export async function interactElement(params: Record<string, string>): Promise<u
 async function pressKey(params: Record<string, string>): Promise<unknown> {
   const tabId = await resolveTabId(params.tabId);
   const key = requireParam(params, "key");
+  
+  const parsed = parseKeyCombo(key);
+  const argsObj = {
+    key: parsed.key,
+    code: parsed.code,
+    ctrlKey: parsed.ctrlKey,
+    altKey: parsed.altKey,
+    shiftKey: parsed.shiftKey,
+    metaKey: parsed.metaKey,
+  };
+
   const result = await chrome.scripting.executeScript({
     target: { tabId },
-    func: (
-      keyValue: string,
-      codeValue: string | undefined,
-      ctrlKey: boolean,
-      altKey: boolean,
-      shiftKey: boolean,
-      metaKey: boolean,
-    ) => {
+    func: (eventData) => {
       const target = document.activeElement ?? document.body;
       const eventInit: KeyboardEventInit = {
-        key: keyValue,
-        code: codeValue,
+        key: eventData.key,
+        code: eventData.code,
         bubbles: true,
         cancelable: true,
-        ctrlKey,
-        altKey,
-        shiftKey,
-        metaKey,
+        ctrlKey: eventData.ctrlKey,
+        altKey: eventData.altKey,
+        shiftKey: eventData.shiftKey,
+        metaKey: eventData.metaKey,
       };
 
       target.dispatchEvent(new KeyboardEvent("keydown", eventInit));
       target.dispatchEvent(new KeyboardEvent("keypress", eventInit));
       target.dispatchEvent(new KeyboardEvent("keyup", eventInit));
 
-      return { ok: true, key: keyValue, code: codeValue };
+      return { ok: true, key: eventData.key, code: eventData.code };
     },
-    args: [
-      key,
-      params.code,
-      params.ctrlKey === "true",
-      params.altKey === "true",
-      params.shiftKey === "true",
-      params.metaKey === "true",
-    ],
+    args: [argsObj],
   });
 
   return result[0]?.result;

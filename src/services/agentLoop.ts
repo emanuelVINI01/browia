@@ -1,8 +1,49 @@
-import { StorageService, type Message, type PendingApproval } from "./storageService";
+import { StorageService, type AgentDebugEvent, type Message, type PendingApproval, type AgentRuntimeState } from "./storageService";
 import { OpenaiService } from "./openaiService";
 import { GeminiService } from "./geminiService";
+import { GroqService } from "./groqService";
 import { OllamaService } from "./ollamaService";
-import { McpEngine, type ToolCall } from "./mcpEngine";
+import { McpEngine, type ToolCall, normalizeToolArgs } from "./mcpEngine";
+import type { AiProvider } from "../config/aiModels";
+import { TokenBudgetManager } from "./tokenBudgetManager";
+import { compressToolResultForModel } from "./toolResultCompressor";
+import { resolveTabId } from "./mcp/utils";
+import { SITE_RECIPES } from "./siteRecipes";
+
+export interface PageSnapshotCache {
+  tabId: number;
+  url: string;
+  capturedAt: number;
+  tabInfo?: unknown;
+  inventoryCompact?: unknown;
+  domCandidates?: unknown;
+  forms?: unknown;
+}
+
+class PageCache {
+  private static cache: Record<number, PageSnapshotCache> = {};
+
+  static get(tabId: number): PageSnapshotCache | undefined {
+    return this.cache[tabId];
+  }
+
+  static set(tabId: number, data: Partial<PageSnapshotCache>) {
+    const existing = this.cache[tabId] || { tabId, url: "", capturedAt: Date.now() };
+    this.cache[tabId] = {
+      ...existing,
+      ...data,
+      capturedAt: Date.now(),
+    };
+  }
+
+  static invalidate(tabId: number) {
+    delete this.cache[tabId];
+  }
+
+  static clear() {
+    this.cache = {};
+  }
+}
 
 export interface ToolCallState {
   name: string;
@@ -108,12 +149,17 @@ export class AgentLoop {
       "bookmarks_search",
       "history_search",
       "read_clipboard",
+      "final_answer",
+      "think",
+      "advise",
+      "resolve_element",
+      "summarize_current_page_compact",
     ];
     return safeTools.includes(name);
   }
 
   static async run(
-    provider: "openai" | "gemini" | "ollama",
+    provider: AiProvider,
     model: string,
     sessionId: string,
     onUpdate: (update: AgentStepUpdate) => void,
@@ -125,11 +171,86 @@ export class AgentLoop {
     
     const openaiApiKey = parsedSettings.openaiApiKey || "";
     const geminiApiKey = parsedSettings.geminiApiKey || "";
+    const groqApiKey = parsedSettings.groqApiKey || "";
     const ollamaEndpoint = parsedSettings.ollamaEndpoint || "http://localhost:11434";
     const customPrompt = parsedSettings.customSystemPrompt || "";
 
     const systemPrompt = customPrompt || (await this.loadDefaultSystemPrompt());
     
+    const session = StorageService.getSession(sessionId);
+    if (!session) {
+      throw new Error(`Sessão não encontrada: ${sessionId}`);
+    }
+
+    // Nível 0: Casual Chat bypass (Parte 1 / Nível 0)
+    const requiresBrowserTool = this.shouldRequireBrowserTool(session.messages);
+    if (!requiresBrowserTool) {
+      onUpdate({ type: "ai_thinking", message: "Pensando na resposta..." });
+      try {
+        const casualSystemPrompt = "Você é o Browia, um assistente de IA amigável instalado no navegador. Responda à pergunta do usuário diretamente, sem usar ferramentas, de forma curta e simpática.";
+        const responseRes = await this.sendProviderMessage(
+          provider,
+          model,
+          casualSystemPrompt,
+          session.messages,
+          { openaiApiKey, geminiApiKey, groqApiKey, ollamaEndpoint },
+          {},
+          signal
+        );
+        console.log(`[Browia API Tokens - Casual Chat] Provider: ${provider}, Model: ${model}, Input: ${responseRes.inputTokens ?? 0}, Output: ${responseRes.outputTokens ?? 0}, Total: ${(responseRes.inputTokens ?? 0) + (responseRes.outputTokens ?? 0)}, Speed: ${responseRes.tokensPerSecond ?? 0} tok/s`);
+        const budgetManager = new TokenBudgetManager(provider);
+        const callTokens = budgetManager.recordCall(
+          `${casualSystemPrompt}\n\n${JSON.stringify(session.messages)}`,
+          responseRes.text,
+          responseRes.inputTokens,
+          responseRes.outputTokens,
+        );
+        const stats = budgetManager.getStats();
+        const providerCallEntry = {
+          sequence: stats.requestCount,
+          kind: "provider" as const,
+          provider,
+          model,
+          inputTokens: callTokens.inputTokens,
+          outputTokens: callTokens.outputTokens,
+          totalTokens: callTokens.inputTokens + callTokens.outputTokens,
+          tokensPerSecond: responseRes.tokensPerSecond,
+          estimated: responseRes.inputTokens === undefined || responseRes.outputTokens === undefined,
+          timestamp: new Date().toISOString(),
+        };
+        this.updateRuntimeBudgetStats(sessionId, stats, {
+          lastInputTokens: callTokens.inputTokens,
+          lastOutputTokens: callTokens.outputTokens,
+          lastTokensPerSecond: responseRes.tokensPerSecond,
+        }, providerCallEntry);
+        this.logDebug({
+          sessionId,
+          provider,
+          model,
+          phase: "provider_token_usage",
+          message: `Consumo de tokens da chamada ${stats.requestCount}.`,
+          data: providerCallEntry,
+        });
+        this.logDebug({
+          sessionId,
+          provider,
+          model,
+          phase: "casual_chat_response",
+          message: "Resposta do Casual Chat",
+          data: providerCallEntry,
+        });
+        this.appendFinalAssistantMessage(sessionId, responseRes.text);
+        onUpdate({ type: "final_answer", finalContent: responseRes.text });
+        return responseRes.text;
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        onUpdate({ type: "error", message: `Erro na chamada de IA: ${errMsg}` });
+        throw err;
+      }
+    }
+
+    // Initialize TokenBudgetManager (Parte 8)
+    const budgetManager = new TokenBudgetManager(provider);
     const maxIterations = 12; // safety limit
 
     for (let iter = 0; iter < maxIterations; iter++) {
@@ -138,125 +259,348 @@ export class AgentLoop {
         throw new Error("Cancelled");
       }
 
-      // Load session at the beginning of each iteration to get current history
-      const session = StorageService.getSession(sessionId);
-      if (!session) {
+      // Enforce budget limits
+      const budgetCheck = budgetManager.isBudgetExceeded();
+      if (budgetCheck.exceeded) {
+        const budgetError = budgetCheck.reason || "Orçamento de tokens ou chamadas excedido para a tarefa.";
+        onUpdate({ type: "error", message: budgetError });
+        throw new Error(budgetError);
+      }
+
+      // Reload session to get current messages
+      const currentSession = StorageService.getSession(sessionId);
+      if (!currentSession) {
         throw new Error(`Sessão não encontrada: ${sessionId}`);
       }
-      const originalUserRequest = this.getOriginalUserRequest(session.messages);
-      const executedStepsAtIterationStart = this.extractExecutedSteps(session.messages);
+      const originalUserRequest = this.getOriginalUserRequest(currentSession.messages);
+      const executedStepsAtIterationStart = this.extractExecutedSteps(currentSession.messages);
 
+      // Extract current tab info from executed steps if available
+      const lastTabInfo = [...executedStepsAtIterationStart].reverse().find(s => s.tool === "get_tab_info" && s.status === "success" && s.result);
+      let activeTabUrl = "";
+      let activeTabTitle = "";
+      if (lastTabInfo?.result) {
+        try {
+          const parsed = JSON.parse(lastTabInfo.result);
+          if (parsed && typeof parsed === "object") {
+            activeTabUrl = parsed.url || "";
+            activeTabTitle = parsed.title || "";
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      const stats = budgetManager.getStats();
       onUpdate({ type: "ai_thinking", message: `A IA está pensando (passo ${iter + 1})...` });
 
+      // Build compact model context (Parte 14)
+      const compactHistory = this.buildAgentModelContext(
+        originalUserRequest,
+        executedStepsAtIterationStart,
+        this.getLastToolResponseXml(currentSession.messages),
+        activeTabUrl,
+        activeTabTitle,
+        stats
+      );
+
       let responseText: string;
+      let responseRes: { text: string; inputTokens?: number; outputTokens?: number; tokensPerSecond?: number };
       try {
-        responseText = await this.sendProviderMessage(
+        responseRes = await this.sendProviderMessage(
           provider,
           model,
           systemPrompt,
-          session.messages,
-          { openaiApiKey, geminiApiKey, ollamaEndpoint },
+          compactHistory, // Compact context (no bloated DOM/inventory histories)
+          { openaiApiKey, geminiApiKey, groqApiKey, ollamaEndpoint },
+          {
+            onGroqRateLimitRetry: (message, data) => {
+              onUpdate({ type: "ai_thinking", message });
+              this.logDebug({
+                sessionId,
+                provider,
+                model,
+                phase: "groq_rate_limit_retry",
+                message,
+                data,
+              });
+            },
+            onGeminiRateLimitRetry: (message, data) => {
+              onUpdate({ type: "ai_thinking", message });
+              this.logDebug({
+                sessionId,
+                provider,
+                model,
+                phase: "gemini_rate_limit_retry",
+                message,
+                data,
+              });
+            },
+          },
+          signal
         );
+        responseText = responseRes.text;
       } catch (err: unknown) {
         const errMsg = err instanceof Error ? err.message : String(err);
         onUpdate({ type: "error", message: `Erro na chamada de IA: ${errMsg}` });
         throw err;
       }
 
+      // Record input and output tokens
+      console.log(`[Browia API Tokens - Main Loop] Iteration: ${iter + 1}, Provider: ${provider}, Model: ${model}, Input: ${responseRes.inputTokens ?? 0}, Output: ${responseRes.outputTokens ?? 0}, Total: ${(responseRes.inputTokens ?? 0) + (responseRes.outputTokens ?? 0)}, Speed: ${responseRes.tokensPerSecond ?? 0} tok/s`);
+      const promptForEstimation = `${systemPrompt}\n\n${JSON.stringify(compactHistory)}`;
+      const callTokens = budgetManager.recordCall(promptForEstimation, responseText, responseRes.inputTokens, responseRes.outputTokens);
+
+      // Save token usage details to budgetStats
+      const currentStats = budgetManager.getStats();
+      const providerCallEntry = {
+        sequence: currentStats.requestCount,
+        kind: "provider" as const,
+        provider,
+        model,
+        iteration: iter + 1,
+        inputTokens: callTokens.inputTokens,
+        outputTokens: callTokens.outputTokens,
+        totalTokens: callTokens.inputTokens + callTokens.outputTokens,
+        tokensPerSecond: responseRes.tokensPerSecond,
+        estimated: responseRes.inputTokens === undefined || responseRes.outputTokens === undefined,
+        timestamp: new Date().toISOString(),
+      };
+      this.updateRuntimeBudgetStats(sessionId, currentStats, {
+        lastInputTokens: callTokens.inputTokens,
+        lastOutputTokens: callTokens.outputTokens,
+        lastTokensPerSecond: responseRes.tokensPerSecond,
+      }, providerCallEntry);
+      this.logDebug({
+        sessionId,
+        provider,
+        model,
+        phase: "provider_token_usage",
+        message: `Consumo de tokens da chamada ${currentStats.requestCount}.`,
+        data: providerCallEntry,
+      });
+
       // Check if response contains tool calls
-      let toolCalls = McpEngine.parseXmlCommands(responseText);
+      let toolCalls = this.normalizeModelToolCalls(McpEngine.parseXmlCommands(responseText));
+      
+      // If final_answer is present but called as a tool call, clean up
+      const finalAnswerCall = toolCalls.find((call) => call.name === "final_answer");
 
-      if (toolCalls.length === 0 && this.shouldRequireBrowserTool(session.messages)) {
-        onUpdate({
-          type: "ai_thinking",
-          message: "A IA respondeu sem ferramenta; reforçando uso de MCP...",
-        });
+      this.logDebug({
+        sessionId,
+        provider,
+        model,
+        phase: "model_response",
+        message: toolCalls.length > 0 ? "Modelo emitiu XML MCP." : "Modelo respondeu sem XML MCP.",
+        data: {
+          iteration: iter + 1,
+          requiresBrowserTool,
+          toolCalls: toolCalls.map((call) => call.name),
+          responsePreview: this.truncateForPrompt(responseText, 1200),
+        },
+      });
 
-        responseText = await this.sendProviderMessage(
-          provider,
-          model,
-          `${systemPrompt}\n\nINSTRUCAO RUNTIME OBRIGATORIA: a ultima solicitacao depende do navegador/aba/DOM. A resposta anterior sem <tool_call> e invalida. Emita agora um <execution_plan> curto e pelo menos um <tool_call>. Nao responda em texto comum antes de executar ferramentas.`,
-          session.messages,
-          { openaiApiKey, geminiApiKey, ollamaEndpoint },
-        );
-        toolCalls = McpEngine.parseXmlCommands(responseText);
-      }
-
-      if (toolCalls.length === 0) {
-        // Prevent premature ending: check if AI explains intent of action but forgot tool call block
-        const textLower = responseText.toLowerCase();
-        const containsActionIntent = 
-          /\b(vou clicar|vou tentar|vou extrair|vou digitar|vou preencher|vou navegar|vou rolar|vou buscar|vou pesquisar|tentando|clicando|digitando|navegando|going to click|going to type|going to extract|going to navigate|will click|will type|will search|will extract|will navigate)\b/i.test(textLower);
-
-        if (containsActionIntent && this.shouldRequireBrowserTool(session.messages)) {
-          onUpdate({
-            type: "ai_thinking",
-            message: "Reforçando execução: o agente informou intenção de agir verbalmente mas não emitiu XML...",
-          });
-
-          const activeSession = StorageService.getSession(sessionId);
-          if (activeSession) {
-            activeSession.messages.push({
-              id: crypto.randomUUID(),
-              role: "assistant",
-              content: responseText,
-              timestamp: new Date().toISOString(),
-            });
-            activeSession.messages.push({
-              id: crypto.randomUUID(),
-              role: "user",
-              content: "Você informou que iria realizar uma ação (como clicar, digitar ou navegar), mas não enviou nenhum bloco XML <tool_call>. Por favor, execute a ferramenta MCP apropriada para continuar a tarefa.",
-              timestamp: new Date().toISOString(),
-            });
-            StorageService.saveSession(activeSession);
-          }
-          continue; // Rerun loop with prompt reinforcement
-        }
-
-        // No tools called, this is the final answer
-        const cleanedResponse = responseText.trim();
-        const requiresBrowserTool = this.shouldRequireBrowserTool(session.messages);
+      if (finalAnswerCall && toolCalls.every((call) => call.name === "final_answer")) {
+        const finalContent = this.extractFinalAnswer(finalAnswerCall);
         const completion: TaskCompletionCheck = requiresBrowserTool
           ? await this.evaluateTaskCompletion({
               originalUserRequest,
-              responseText: cleanedResponse,
+              responseText: finalContent,
               executedSteps: executedStepsAtIterationStart,
             })
           : {
-              completed: cleanedResponse.length > 0,
-              reason: "Conversa comum sem necessidade de ferramenta MCP.",
+              completed: finalContent.length > 0,
+              reason: "Resposta final emitida pela ferramenta final_answer.",
             };
 
         if (!completion.completed) {
           onUpdate({
             type: "ai_thinking",
-            message: "A tarefa ainda não foi concluída; escolhendo a próxima ação...",
+            message: "Resposta final prematura; continuando execução...",
           });
-
           this.appendInternalContinuationPrompt(
             sessionId,
             originalUserRequest,
             executedStepsAtIterationStart,
             completion.reason,
-            cleanedResponse,
+            finalContent,
           );
           continue;
         }
-        
-        // Save final assistant response to storage
-        const activeSession = StorageService.getSession(sessionId);
-        if (activeSession) {
-          activeSession.messages.push({
-            id: crypto.randomUUID(),
-            role: "assistant",
-            content: cleanedResponse,
-            timestamp: new Date().toISOString(),
-          });
-          StorageService.saveSession(activeSession);
+
+        this.appendFinalAssistantMessage(sessionId, finalContent);
+        onUpdate({ type: "final_answer", finalContent });
+        return finalContent;
+      }
+
+      if (finalAnswerCall) {
+        toolCalls = toolCalls.filter((call) => call.name !== "final_answer");
+      }
+
+      const hasTabContext = executedStepsAtIterationStart.some((step) => step.tool === "get_tab_info" && step.status === "success");
+      const triesMutationWithoutTabContext = requiresBrowserTool
+        && !hasTabContext
+        && !toolCalls.some((call) => call.name === "get_tab_info")
+        && toolCalls.some((call) => this.isMutatingTool(call.name));
+
+      if (triesMutationWithoutTabContext) {
+        const bootstrapTool: ToolCall = { name: "get_tab_info", params: {} };
+        this.logDebug({
+          sessionId,
+          provider,
+          model,
+          phase: "unsafe_action_bootstrap",
+          message: "Modelo tentou agir sem contexto de aba; executando get_tab_info antes.",
+          data: {
+            iteration: iter + 1,
+            blockedTools: toolCalls.map((call) => call.name),
+          },
+        });
+
+        const bootstrapResponse = `<execution_plan>Obter contexto da aba antes de qualquer interação.</execution_plan>\n${this.renderToolCallXml(bootstrapTool)}`;
+        const bootstrapStates: ToolCallState[] = [{ name: bootstrapTool.name, params: {}, status: "pending" }];
+        const bootstrapSteps = await this.executeApprovedToolCalls(
+          sessionId,
+          bootstrapResponse,
+          [bootstrapTool],
+          bootstrapStates,
+          onUpdate,
+          budgetManager,
+          activeTabUrl,
+          signal,
+          { recordAssistantMessage: true },
+        );
+        this.appendInternalContinuationPrompt(
+          sessionId,
+          originalUserRequest,
+          [...executedStepsAtIterationStart, ...bootstrapSteps],
+          "O modelo tentou executar uma ação mutante sem primeiro identificar a aba. O runtime executou get_tab_info e bloqueou a ação prematura.",
+          responseText,
+        );
+        continue;
+      }
+
+      const suggestedRecoveryTool = this.getSuggestedRecoveryTool(executedStepsAtIterationStart);
+      const ignoresSuggestedRecovery = suggestedRecoveryTool
+        && !toolCalls.some((call) => call.name === suggestedRecoveryTool.name)
+        && toolCalls.some((call) => this.isMutatingTool(call.name));
+
+      if (suggestedRecoveryTool && ignoresSuggestedRecovery) {
+        this.logDebug({
+          sessionId,
+          provider,
+          model,
+          phase: "suggested_tool_recovery",
+          message: `Executando ${suggestedRecoveryTool.name} sugerida por falha anterior antes de nova ação.`,
+          data: {
+            iteration: iter + 1,
+            suggestedRecoveryTool,
+            blockedTools: toolCalls.map((call) => call.name),
+          },
+        });
+
+        const recoveryResponse = `<execution_plan>Buscar o elemento correto sugerido pela falha anterior antes de tentar nova interação.</execution_plan>\n${this.renderToolCallXml(suggestedRecoveryTool)}`;
+        const recoveryStates: ToolCallState[] = [{
+          name: suggestedRecoveryTool.name,
+          params: suggestedRecoveryTool.params,
+          status: "pending",
+        }];
+        const recoverySteps = await this.executeApprovedToolCalls(
+          sessionId,
+          recoveryResponse,
+          [suggestedRecoveryTool],
+          recoveryStates,
+          onUpdate,
+          budgetManager,
+          activeTabUrl,
+          signal,
+          { recordAssistantMessage: true },
+        );
+        this.appendInternalContinuationPrompt(
+          sessionId,
+          originalUserRequest,
+          [...executedStepsAtIterationStart, ...recoverySteps],
+          `A ferramenta anterior sugeriu ${suggestedRecoveryTool.name}; o runtime executou essa busca antes de permitir nova interação.`,
+          responseText,
+        );
+        continue;
+      }
+
+      if (toolCalls.length === 0 && requiresBrowserTool) {
+        const recoveryCount = this.countMcpFormatCorrections(currentSession.messages);
+        const isRecipeKnown = activeTabUrl ? Boolean(SITE_RECIPES[new URL(activeTabUrl).hostname.replace("www.", "") as keyof typeof SITE_RECIPES]) : false;
+        const bootstrapTool = this.getBrowserBootstrapTool(executedStepsAtIterationStart, isRecipeKnown);
+
+        this.logDebug({
+          sessionId,
+          provider,
+          model,
+          phase: "missing_mcp_recovery",
+          message: bootstrapTool
+            ? `Modelo sem MCP; executando bootstrap seguro ${bootstrapTool.name}.`
+            : "Modelo sem MCP; adicionando instrucao interna curta.",
+          data: {
+            iteration: iter + 1,
+            recoveryCount,
+            bootstrapTool: bootstrapTool?.name,
+          },
+        });
+
+        if (recoveryCount > 0 && bootstrapTool) {
+          const bootstrapResponse = `<execution_plan>Obter contexto minimo da aba ativa para destravar o proximo passo MCP.</execution_plan>\n${this.renderToolCallXml(bootstrapTool)}`;
+          const bootstrapStates: ToolCallState[] = [{ name: bootstrapTool.name, params: {}, status: "pending" }];
+          const bootstrapSteps = await this.executeApprovedToolCalls(
+            sessionId,
+            bootstrapResponse,
+            [bootstrapTool],
+            bootstrapStates,
+            onUpdate,
+            budgetManager,
+            activeTabUrl,
+            signal,
+            { recordAssistantMessage: true },
+          );
+          this.appendInternalContinuationPrompt(
+            sessionId,
+            originalUserRequest,
+            [...executedStepsAtIterationStart, ...bootstrapSteps],
+            `O modelo respondeu sem XML MCP. O runtime executou ${bootstrapTool.name} para fornecer contexto minimo.`,
+            responseText,
+          );
+          continue;
         }
 
-        onUpdate({ type: "final_answer", finalContent: cleanedResponse });
-        return cleanedResponse;
+        onUpdate({
+          type: "ai_thinking",
+          message: "A IA respondeu sem ferramenta; registrando correção MCP...",
+        });
+
+        this.appendMcpFormatCorrectionPrompt(sessionId, originalUserRequest, responseText);
+        continue;
+      }
+
+      if (toolCalls.length === 0) {
+        const cleanedResponse = responseText.trim();
+
+        if (!requiresBrowserTool && cleanedResponse) {
+          this.appendFinalAssistantMessage(sessionId, cleanedResponse);
+          onUpdate({ type: "final_answer", finalContent: cleanedResponse });
+          return cleanedResponse;
+        }
+
+        onUpdate({
+          type: "ai_thinking",
+          message: "A tarefa depende do navegador; solicitando próxima tool MCP...",
+        });
+
+        this.appendInternalContinuationPrompt(
+          sessionId,
+          originalUserRequest,
+          executedStepsAtIterationStart,
+          "A intencao foi classificada como browser; texto comum sem tool MCP nao e uma acao valida.",
+          cleanedResponse,
+        );
+        continue;
       }
 
       // Prepare UI states for tool calls
@@ -294,6 +638,8 @@ export class AgentLoop {
           executedSafeTools,
           safeStates,
           onUpdate,
+          budgetManager,
+          activeTabUrl,
           signal,
           { recordAssistantMessage: true },
         );
@@ -333,7 +679,7 @@ export class AgentLoop {
             message: "Aguardando aprovação para prosseguir com ações sensíveis...",
             plan,
             pendingApproval,
-            toolCalls: toolStates, // UI receives complete tool list showing executed safe ones
+            toolCalls: toolStates,
           });
 
           const approved = await requestApproval(pendingApproval, toolStates);
@@ -364,13 +710,15 @@ export class AgentLoop {
           StorageService.clearPendingApproval(sessionId);
         }
 
-        // Execute the approved sensitive tools
+        // Execute approved sensitive tools
         const sensitiveSteps = await this.executeApprovedToolCalls(
           sessionId,
           responseText,
           pendingSensitiveTools,
           sensitiveStates,
           onUpdate,
+          budgetManager,
+          activeTabUrl,
           signal,
           { recordAssistantMessage: executedSafeTools.length === 0 },
         );
@@ -429,12 +777,16 @@ export class AgentLoop {
 
     StorageService.clearPendingApproval(approval.sessionId);
 
+    const budgetManager = new TokenBudgetManager(approval.provider);
+
     const executedSteps = await this.executeApprovedToolCalls(
       approval.sessionId,
       approval.responseText,
       approval.toolCalls,
       toolStates,
       onUpdate,
+      budgetManager,
+      "",
       signal,
       { recordAssistantMessage: true },
     );
@@ -517,35 +869,86 @@ export class AgentLoop {
   }
 
   private static async sendProviderMessage(
-    provider: "openai" | "gemini" | "ollama",
+    provider: AiProvider,
     model: string,
     systemPrompt: string,
     history: Message[],
     settings: {
       openaiApiKey: string;
       geminiApiKey: string;
+      groqApiKey: string;
       ollamaEndpoint: string;
     },
-  ): Promise<string> {
+    callbacks: {
+      onGroqRateLimitRetry?: (message: string, data: Record<string, unknown>) => void;
+      onGeminiRateLimitRetry?: (message: string, data: Record<string, unknown>) => void;
+    } = {},
+    signal?: AbortSignal,
+  ): Promise<{ text: string; inputTokens?: number; outputTokens?: number; tokensPerSecond?: number }> {
+    const startTime = Date.now();
+    let res: { text: string; inputTokens?: number; outputTokens?: number };
+
     if (provider === "openai") {
-      return OpenaiService.sendMessage(settings.openaiApiKey, model, systemPrompt, history);
+      res = await OpenaiService.sendMessage(settings.openaiApiKey, model, systemPrompt, history);
+    } else if (provider === "gemini") {
+      res = await GeminiService.sendMessage(settings.geminiApiKey, model, systemPrompt, history, {
+        maxRetries: 3,
+        onRateLimitRetry: (info) => {
+          const waitSeconds = Math.ceil(info.waitMs / 1000);
+          callbacks.onGeminiRateLimitRetry?.(
+            `Gemini 429: aguardando ${waitSeconds}s antes de tentar novamente. Retry ${info.attempt}/${info.maxRetries}...\nMotivo do retry: limite de taxa; fonte=${info.source}, retryAfter=${info.retryAfterMs ?? "n/a"}ms, retryDelay=${info.retryDelayMs ?? "n/a"}ms.`,
+            {
+              waitMs: info.waitMs,
+              retryAfterMs: info.retryAfterMs,
+              retryDelayMs: info.retryDelayMs,
+              source: info.source,
+              attempt: info.attempt,
+              maxRetries: info.maxRetries,
+            },
+          );
+        },
+      }, signal);
+    } else if (provider === "groq") {
+      res = await GroqService.sendMessage(settings.groqApiKey, model, systemPrompt, history, {
+        maxRetries: 3,
+        onRateLimitRetry: (info) => {
+          const waitSeconds = Math.ceil(info.waitMs / 1000);
+          const remaining = info.remainingTokens ?? "0";
+          const limit = info.limitTokens ?? "?";
+          callbacks.onGroqRateLimitRetry?.(
+            `Groq 429: aguardando ${waitSeconds}s para liberar tokens. Retry ${info.attempt}/${info.maxRetries}...\nMotivo do retry: limite de taxa; tokens restantes=${remaining}/${limit}, resetTokens=${info.resetTokensMs ?? "n/a"}ms, retryAfter=${info.retryAfterMs ?? "n/a"}ms.`,
+            {
+              waitMs: info.waitMs,
+              retryAfterMs: info.retryAfterMs,
+              resetTokensMs: info.resetTokensMs,
+              remainingTokens: info.remainingTokens,
+              limitTokens: info.limitTokens,
+              attempt: info.attempt,
+              maxRetries: info.maxRetries,
+            },
+          );
+        },
+      }, signal);
+    } else if (provider === "ollama") {
+      res = await OllamaService.sendMessage(settings.ollamaEndpoint, model, systemPrompt, history);
+    } else {
+      throw new Error(`Provedor desconhecido: ${provider}`);
     }
 
-    if (provider === "gemini") {
-      return GeminiService.sendMessage(settings.geminiApiKey, model, systemPrompt, history);
-    }
+    const durationMs = Date.now() - startTime;
+    const durationSec = durationMs / 1000;
+    const tokensPerSecond = res.outputTokens && durationSec > 0 ? Math.round(res.outputTokens / durationSec) : undefined;
 
-    if (provider === "ollama") {
-      return OllamaService.sendMessage(settings.ollamaEndpoint, model, systemPrompt, history);
-    }
-
-    throw new Error(`Provedor desconhecido: ${provider}`);
+    return {
+      ...res,
+      tokensPerSecond,
+    };
   }
 
   private static shouldRequireBrowserTool(messages: Message[]): boolean {
     const latestUserMessage = this.getOriginalUserRequest(messages);
     const browserTaskPattern =
-      /\b(site|url|aba|pagina|página|dom|html|clique|clica|clicar|foto|avatar|perfil|conta|nome|elemento|bot[aã]o|campo|digite|preencha|pesquisa|pesquise|buscar|busca|procura|google|resultado|screenshot|print|download|cookie|favorito|hist[oó]rico|localstorage|sessionstorage)\b/i;
+      /\b(site|url|aba|pagina|página|dom|html|clique|clica|clicar|foto|avatar|perfil|conta|nome|elemento|bot[aã]o|campo|digite|preencha|pesquisa|pesquise|buscar|busca|procura|google|resultado|screenshot|print|download|cookie|favorito|hist[oó]rico|localstorage|sessionstorage|canal|channel|v[ií]deo|videos|vídeos|post|posts|postei|tiktok|youtube|shorts|reels)\b/i;
 
     return browserTaskPattern.test(latestUserMessage);
   }
@@ -556,6 +959,26 @@ export class AgentLoop {
       .find((message) => message.role === "user" && !message.internal)
       ?.content
       .trim() ?? "";
+  }
+
+  private static extractFinalAnswer(call: ToolCall): string {
+    return (call.params.answer ?? call.params.content ?? call.params.message ?? "").trim();
+  }
+
+  private static appendFinalAssistantMessage(sessionId: string, content: string): void {
+    const session = StorageService.getSession(sessionId);
+
+    if (!session) {
+      return;
+    }
+
+    session.messages.push({
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content,
+      timestamp: new Date().toISOString(),
+    });
+    StorageService.saveSession(session);
   }
 
   private static async evaluateTaskCompletion(input: {
@@ -711,6 +1134,136 @@ export class AgentLoop {
     StorageService.saveSession(session);
   }
 
+  private static appendMcpFormatCorrectionPrompt(
+    sessionId: string,
+    originalUserRequest: string,
+    invalidResponse: string,
+  ): void {
+    const session = StorageService.getSession(sessionId);
+    if (!session) {
+      return;
+    }
+
+    session.messages.push({
+      id: crypto.randomUUID(),
+      role: "assistant",
+      internal: true,
+      content: this.truncateForPrompt(invalidResponse, 1800),
+      timestamp: new Date().toISOString(),
+    });
+    session.messages.push({
+      id: crypto.randomUUID(),
+      role: "user",
+      internal: true,
+      content: [
+        "[CORRECAO INTERNA MCP - NAO MOSTRAR AO USUARIO]",
+        "A resposta anterior nao contem nenhum bloco <tool_call> valido.",
+        `Objetivo original do usuario: ${originalUserRequest}`,
+        "Se a tarefa depende da aba atual, responda agora somente com XML MCP.",
+        "Formato minimo valido:",
+        "<execution_plan>plano curto</execution_plan>",
+        "<tool_call name=\"get_tab_info\"/>",
+        "Nao use markdown, codigo Python, tool_code, JSON solto nem texto comum.",
+      ].join("\n"),
+      timestamp: new Date().toISOString(),
+    });
+    StorageService.saveSession(session);
+  }
+
+  private static countMcpFormatCorrections(messages: Message[]): number {
+    return messages.filter((message) =>
+      message.internal
+      && message.role === "user"
+      && message.content.includes("[CORRECAO INTERNA MCP")
+    ).length;
+  }
+
+  private static getBrowserBootstrapTool(steps: ExecutedStep[], isRecipeKnown = false): ToolCall | null {
+    if (!steps.some((step) => step.tool === "get_tab_info")) {
+      return { name: "get_tab_info", params: {} };
+    }
+
+    // Do NOT bootstrap get_page_inventory if a recipe is already known!
+    if (!isRecipeKnown && !steps.some((step) => step.tool === "get_page_inventory") && !steps.some((step) => step.tool === "query_elements")) {
+      return { name: "get_page_inventory", params: { limit: "25" } };
+    }
+
+    return null;
+  }
+
+  private static renderToolCallXml(call: ToolCall): string {
+    const params = Object.entries(call.params)
+      .map(([name, value]) => `<param name="${this.escapeXmlAttribute(name)}">${this.escapeXmlText(value)}</param>`)
+      .join("");
+
+    if (!params) {
+      return `<tool_call name="${this.escapeXmlAttribute(call.name)}"/>`;
+    }
+
+    return `<tool_call name="${this.escapeXmlAttribute(call.name)}">${params}</tool_call>`;
+  }
+
+  private static normalizeModelToolCalls(toolCalls: ToolCall[]): ToolCall[] {
+    return toolCalls.map((call) => {
+      const params = { ...call.params };
+      let name = call.name;
+
+      if (name === "navigate_to" || name === "open_url") {
+        name = "navigate_tab";
+      }
+
+      if (name === "interact_element" && params.value === undefined && params.text !== undefined) {
+        params.value = params.text;
+        delete params.text;
+      }
+
+      return { ...call, name, params };
+    });
+  }
+
+  private static getSuggestedRecoveryTool(steps: ExecutedStep[]): ToolCall | null {
+    const lastStep = [...steps].reverse().find((step) => step.status === "error" && step.error);
+
+    if (!lastStep?.error) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(lastStep.error) as {
+        suggestedNextTool?: unknown;
+        suggestedArgs?: unknown;
+      };
+
+      if (
+        typeof parsed.suggestedNextTool !== "string"
+        || !parsed.suggestedArgs
+        || typeof parsed.suggestedArgs !== "object"
+        || Array.isArray(parsed.suggestedArgs)
+      ) {
+        return null;
+      }
+
+      const allowedRecoveryTools = new Set(["query_elements", "resolve_element", "get_page_inventory"]);
+      if (!allowedRecoveryTools.has(parsed.suggestedNextTool)) {
+        return null;
+      }
+
+      const params: Record<string, string> = {};
+      for (const [key, value] of Object.entries(parsed.suggestedArgs as Record<string, unknown>)) {
+        if (value !== undefined && value !== null) {
+          params[key] = String(value);
+        }
+      }
+
+      return {
+        name: parsed.suggestedNextTool,
+        params,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   private static extractExecutedSteps(messages: Message[]): ExecutedStep[] {
     const steps: ExecutedStep[] = [];
     let pendingCalls: ToolCall[] = [];
@@ -772,6 +1325,8 @@ export class AgentLoop {
       wait_for_page_ready: "aguardar a pagina ficar carregada e estavel antes de concluir ou ler dados",
       wait_for_navigation_or_dom_change: "aguardar navegacao, rota SPA ou mudanca de DOM apos uma acao",
       call_on_condition: "aguardar uma condicao e executar outra ferramenta MCP quando ela for satisfeita",
+      think: "informar ao usuario, de forma curta, o que o agente esta analisando",
+      advise: "informar ao usuario uma decisao, cuidado ou proximo passo durante a execucao",
       interact_element: "interagir fisicamente com um elemento pelo vortexId",
       interact_cached_element: "interagir com um elemento salvo no cache",
       extract_page_text: "extrair texto visivel da pagina",
@@ -785,7 +1340,7 @@ export class AgentLoop {
 
   private static createPendingApproval(input: {
     sessionId: string;
-    provider: "openai" | "gemini" | "ollama";
+    provider: AiProvider;
     model: string;
     responseText: string;
     plan: AgentExecutionPlan;
@@ -918,7 +1473,63 @@ export class AgentLoop {
     return `${compact.slice(0, maxChars)}...`;
   }
 
+  private static escapeXmlAttribute(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  private static escapeXmlText(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  private static logDebug(event: Omit<AgentDebugEvent, "id" | "createdAt">): void {
+    try {
+      StorageService.appendAgentDebugEvent(event);
+    } catch (error) {
+      console.debug("Browia debug log failed", error);
+    }
+  }
+
+  private static updateRuntimeBudgetStats(
+    sessionId: string,
+    stats: ReturnType<TokenBudgetManager["getStats"]>,
+    update: Partial<NonNullable<AgentRuntimeState["budgetStats"]>>,
+    callEntry?: NonNullable<NonNullable<AgentRuntimeState["budgetStats"]>["callHistory"]>[number],
+  ): void {
+    const currentRuntime = StorageService.getAgentRuntimeState();
+    const previousBudgetStats = currentRuntime.budgetStats;
+    const previousHistory = previousBudgetStats?.callHistory ?? [];
+    const callHistory = callEntry ? [...previousHistory, callEntry].slice(-50) : previousHistory;
+
+    StorageService.saveAgentRuntimeState({
+      ...currentRuntime,
+      sessionId,
+      budgetStats: {
+        ...previousBudgetStats,
+        totalTokens: stats.totalTokens,
+        requestCount: stats.requestCount,
+        maxTokens: stats.budget.maxTokensPerTask,
+        rawSize: previousBudgetStats?.rawSize ?? 0,
+        compressedSize: previousBudgetStats?.compressedSize ?? 0,
+        compressionRatio: previousBudgetStats?.compressionRatio ?? 0,
+        lastCompressedTool: previousBudgetStats?.lastCompressedTool ?? "",
+        ...update,
+        callHistory,
+      },
+    });
+  }
+
   private static describeRuntimePhase(call: ToolCall): string {
+    if (call.name === "think" || call.name === "advise") {
+      return call.params.message || "Atualizando raciocínio do agente...";
+    }
+
     if (call.name === "interact_element" || call.name === "interact_cached_element") {
       if (call.params.action === "type") return "Digitando pesquisa...";
       if (call.params.action === "click") return "Clicando no elemento...";
@@ -945,6 +1556,10 @@ export class AgentLoop {
   }
 
   private static describePostToolPhase(call: ToolCall): string {
+    if (call.name === "think" || call.name === "advise") {
+      return call.params.message || "Atualização registrada. Continuando...";
+    }
+
     if (call.name === "press_key" && /^enter$/i.test(call.params.key ?? "")) return "Busca enviada. Aguardando leitura dos resultados...";
     if (call.name === "wait_for_page_ready") return "Página estabilizada. Lendo próximo estado...";
     if (call.name === "wait_for_navigation_or_dom_change") return "Mudança detectada. Lendo próximo estado...";
@@ -981,6 +1596,8 @@ export class AgentLoop {
     toolCalls: ToolCall[],
     toolStates: ToolCallState[],
     onUpdate: (update: AgentStepUpdate) => void,
+    budgetManager: TokenBudgetManager,
+    activeTabUrl: string,
     signal?: AbortSignal,
     options: { recordAssistantMessage?: boolean } = {},
   ): Promise<ExecutedStep[]> {
@@ -1016,6 +1633,11 @@ export class AgentLoop {
       }
 
       const call = toolCalls[i];
+      
+      // Schema validation/conversion (Parte 11 / 1)
+      const normalizedArgs = normalizeToolArgs(call.name, call.params);
+      call.params = normalizedArgs as Record<string, string>;
+
       toolStates[i].status = "pending";
       onUpdate({
         type: "executing_tools",
@@ -1027,9 +1649,84 @@ export class AgentLoop {
       let isError = false;
 
       try {
-        const toolResult = await this.executeToolCall(call);
-        resultStr = typeof toolResult === "object" ? JSON.stringify(toolResult) : String(toolResult);
-        toolStates[i].status = "success";
+        let toolResult: unknown;
+        const tabId = await resolveTabId(call.params.tabId);
+
+        // Mutating tools invalidate the cache, read tools query/pull from cache
+        if (this.isMutatingTool(call.name)) {
+          PageCache.invalidate(tabId);
+          toolResult = await this.executeToolCall(call);
+        } else {
+          // Check cache (Parte 15)
+          const cache = PageCache.get(tabId);
+          const now = Date.now();
+          if (cache) {
+            if (call.name === "get_tab_info" && cache.tabInfo && now - cache.capturedAt < 2000) {
+              toolResult = cache.tabInfo;
+            } else if (call.name === "get_page_inventory" && cache.inventoryCompact && now - cache.capturedAt < 10000) {
+              toolResult = cache.inventoryCompact;
+            } else if (call.name === "get_dom_tree" && cache.domCandidates && now - cache.capturedAt < 5000) {
+              toolResult = cache.domCandidates;
+            }
+          }
+
+          if (toolResult === undefined) {
+            toolResult = await this.executeToolCall(call);
+            // Save to cache
+            if (call.name === "get_tab_info") PageCache.set(tabId, { tabInfo: toolResult });
+            if (call.name === "get_page_inventory") PageCache.set(tabId, { inventoryCompact: toolResult });
+            if (call.name === "get_dom_tree") PageCache.set(tabId, { domCandidates: toolResult });
+          }
+        }
+
+        if (toolResult && typeof toolResult === "object") {
+          const resObj = toolResult as { success?: boolean; ok?: boolean };
+          if (resObj.success === false || resObj.ok === false) {
+            isError = true;
+          }
+        }
+
+        const rawStr = typeof toolResult === "object" ? JSON.stringify(toolResult) : String(toolResult);
+        const rawSize = rawStr.length;
+
+        // Compress tool result (Parte 5)
+        const currentUrl = activeTabUrl;
+        const currentDomain = activeTabUrl ? new URL(activeTabUrl).hostname.replace("www.", "") : "";
+        const compressed = compressToolResultForModel(call.name, toolResult, {
+          originalGoal: activeSession ? this.getOriginalUserRequest(activeSession.messages) : "",
+          currentUrl,
+          currentDomain,
+        });
+
+        resultStr = typeof compressed === "object" ? JSON.stringify(compressed) : String(compressed);
+        const compressedSize = resultStr.length;
+
+        // Record tool-result tokens separately from provider API requests.
+        const toolResultTokens = budgetManager.recordToolResult(resultStr);
+        const stats = budgetManager.getStats();
+
+        // Update runtime state with stats for UI debug (Parte 16)
+        this.updateRuntimeBudgetStats(sessionId, stats, {
+          rawSize,
+          compressedSize,
+          compressionRatio: rawSize > 0 ? Math.round(((rawSize - compressedSize) / rawSize) * 100) : 0,
+          lastCompressedTool: call.name,
+        }, {
+          sequence: (StorageService.getAgentRuntimeState().budgetStats?.callHistory?.length ?? 0) + 1,
+          kind: "tool_result",
+          toolName: call.name,
+          outputTokens: toolResultTokens.outputTokens,
+          totalTokens: toolResultTokens.outputTokens,
+          estimated: true,
+          timestamp: new Date().toISOString(),
+        });
+
+        if (isError) {
+          toolStates[i].status = "error";
+          toolStates[i].error = (toolResult as { error?: string }).error || "Ação falhou";
+        } else {
+          toolStates[i].status = "success";
+        }
         toolStates[i].result = resultStr;
       } catch (err: unknown) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -1064,6 +1761,34 @@ export class AgentLoop {
         content: toolResponseXmlBlocks.join("\n\n"),
         timestamp: new Date().toISOString(),
       });
+
+      const interventions = StorageService.consumePendingAgentInterventions(sessionId);
+      if (interventions.length > 0) {
+        postToolSession.messages.push({
+          id: crypto.randomUUID(),
+          role: "user",
+          internal: true,
+          content: [
+            "[INTERVENCAO DO USUARIO APOS TOOL_RESULT - NAO MOSTRAR AO USUARIO]",
+            "O usuario enviou a(s) mensagem(ns) abaixo enquanto o agente estava executando ferramentas.",
+            "Use isso como ajuste/contexto para a proxima decisao, sem perder o objetivo original da tarefa.",
+            ...interventions.map((item, index) => `${index + 1}. ${item.content}`),
+          ].join("\n"),
+          timestamp: new Date().toISOString(),
+        });
+
+        this.logDebug({
+          sessionId,
+          provider: postToolSession.provider,
+          model: postToolSession.model,
+          phase: "queued_user_intervention_consumed",
+          message: `${interventions.length} intervenção(ões) do usuário anexada(s) após tool_result.`,
+          data: {
+            interventionIds: interventions.map((item) => item.id),
+            contents: interventions.map((item) => this.truncateForPrompt(item.content, 400)),
+          },
+        });
+      }
       StorageService.saveSession(postToolSession);
     }
 
@@ -1086,5 +1811,106 @@ export class AgentLoop {
 
     console.log("Mock execution in non-extension environment for:", call);
     return this.mockExecuteTool(call);
+  }
+
+  private static getLastToolResponseXml(messages: Message[]): string | undefined {
+    const toolMsg = [...messages].reverse().find((m) => m.role === "tool");
+    return toolMsg?.content;
+  }
+
+  private static buildAgentModelContext(
+    originalGoal: string,
+    executedSteps: ExecutedStep[],
+    lastToolResultXml: string | undefined,
+    activeTabUrl?: string,
+    activeTabTitle?: string,
+    budgetStats?: {
+      requestCount?: number;
+      totalTokens?: number;
+    }
+  ): Message[] {
+    const domain = activeTabUrl ? new URL(activeTabUrl).hostname.replace("www.", "") : "";
+    const recipe = domain ? SITE_RECIPES[domain as keyof typeof SITE_RECIPES] : undefined;
+    
+    let recipePrompt = "";
+    if (recipe) {
+      recipePrompt = `
+[RECEITA DE ATALHO DE SITES ENCONTRADA PARA ${domain.toUpperCase()}]
+Descrição: ${recipe.description}
+Elementos conhecidos que você pode interagir diretamente via interact_element (passando "selector" ou "id"):
+${Object.entries(recipe.elements).map(([name, locators]) => {
+  return `- ${name}: use ${locators.map(l => `${l.type}=${l.value || l.role}`).join(" ou ")}`;
+}).join("\n")}
+
+Dica: Nunca peça get_dom_tree ou get_page_inventory para este site. Use os locators acima diretamente no interact_element!
+`;
+    }
+
+    let warningPrompt = "";
+    if (executedSteps.length > 0) {
+      const lastStep = executedSteps[executedSteps.length - 1];
+      const hasError = lastStep.status === "error" || lastStep.error !== undefined;
+      const isInteraction = lastStep.tool === "interact_element";
+      
+      if (isInteraction && hasError) {
+        warningPrompt = `
+[ALERTA DE FALHA CRÍTICA NA AÇÃO ANTERIOR]
+A última chamada para 'interact_element' falhou (Erro: ${lastStep.error || "Elemento não encontrado"}).
+Você NÃO pode chamar 'get_dom_tree' ou 'get_page_inventory' brutas sob nenhuma circunstância neste passo.
+Para encontrar o elemento correto, você deve usar 'resolve_element' ou 'query_elements' direcionado com termos específicos (ex: textbox, button, search).
+`;
+      }
+    }
+
+    const compactStateStr = `
+[ESTADO ATUAL DA TAREFA]
+Objetivo Original: ${originalGoal}
+URL atual: ${activeTabUrl || "Não detectada"}
+Título atual: ${activeTabTitle || "Não detectado"}
+Estatísticas de Consumo: Requests=${budgetStats?.requestCount ?? 0}, Tokens estimados=${budgetStats?.totalTokens ?? 0}
+Passos executados até agora:
+${executedSteps.length > 0 ? executedSteps.map((s, i) => `${i+1}. Tool: ${s.tool} -> status: ${s.status}${s.error ? ` (Erro: ${s.error})` : ""}`).join("\n") : "Nenhum passo executado ainda."}
+${recipePrompt}
+${warningPrompt}
+`;
+
+    const messages: Message[] = [
+      {
+        id: crypto.randomUUID(),
+        role: "system",
+        content: compactStateStr,
+        timestamp: new Date().toISOString()
+      }
+    ];
+
+    messages.push({
+      id: crypto.randomUUID(),
+      role: "user",
+      content: `Por favor, execute o objetivo: ${originalGoal}`,
+      timestamp: new Date().toISOString()
+    });
+
+    if (executedSteps.length > 0) {
+      const lastStep = executedSteps[executedSteps.length - 1];
+      const lastCallXml = `<execution_plan>Executar ação anterior</execution_plan>\n<tool_call name="${lastStep.tool}">${Object.entries(lastStep.params).map(([k, v]) => `<param name="${k}">${v}</param>`).join("")}</tool_call>`;
+      
+      messages.push({
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: lastCallXml,
+        timestamp: new Date().toISOString()
+      });
+
+      if (lastToolResultXml) {
+        messages.push({
+          id: crypto.randomUUID(),
+          role: "tool",
+          content: lastToolResultXml,
+          timestamp: new Date().toISOString()
+        });
+      }
+    }
+
+    return messages;
   }
 }

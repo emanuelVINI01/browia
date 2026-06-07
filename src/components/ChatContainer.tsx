@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
-import type { Message } from "../services/storageService";
+import type { Message, AgentRuntimeState } from "../services/storageService";
 import { MessageItem } from "./MessageItem";
-import { Send, Loader2, X, History, Camera, Search } from "lucide-react";
+import { Send, Loader2, X, History, Camera, Search, Download } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { ExecutionApprovalPanel } from "./ExecutionApprovalPanel";
 import type { ApprovalRequestState } from "../hooks/useAgentSession";
@@ -10,6 +10,7 @@ import { ExecutionStepCard } from "./ExecutionStepCard";
 import type { ToolResult } from "./ExecutionStepCard";
 import { McpEngine } from "../services/mcpEngine";
 import type { ToolCall } from "../services/mcpEngine";
+import { SessionExportService, type SessionExportFormat } from "../services/sessionExportService";
 
 interface ChatContainerProps {
   messages: Message[];
@@ -24,9 +25,14 @@ interface ChatContainerProps {
     status: "pending" | "success" | "error";
   }>;
   approvalRequest?: ApprovalRequestState | null;
+  currentSessionId: string | null;
+  devModeEnabled: boolean;
+  queuedInterventionCount: number;
   onApprovePlan: () => void;
   onRejectPlan: () => void;
   onCancelAgent: () => void;
+  onQueueAgentMessage: (text: string) => void;
+  budgetStats?: AgentRuntimeState["budgetStats"];
 }
 
 type TimelineItem =
@@ -81,6 +87,7 @@ function buildTimelineItems(
   }>
 ): TimelineItem[] {
   const items: TimelineItem[] = [];
+  const isDisplayableToolCall = (call: ToolCall) => call.name !== "final_answer";
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -97,6 +104,11 @@ function buildTimelineItems(
     if (msg.role === "assistant") {
       const toolCalls = McpEngine.parseXmlCommands(msg.content);
       if (toolCalls.length > 0) {
+        const displayableToolCalls = toolCalls.filter(isDisplayableToolCall);
+        if (displayableToolCalls.length === 0) {
+          continue;
+        }
+
         const nextMsg = messages[i + 1];
         let toolResults: ToolResult[];
         let hasToolResponse = false;
@@ -104,7 +116,7 @@ function buildTimelineItems(
         if (nextMsg && nextMsg.role === "tool") {
           hasToolResponse = true;
           const parsedResults = parseToolResponses(nextMsg.content);
-          toolResults = toolCalls.map((call) => {
+          toolResults = displayableToolCalls.map((call) => {
             const found = parsedResults.find((r) => r.name === call.name);
             if (found) {
               return {
@@ -120,28 +132,22 @@ function buildTimelineItems(
             };
           });
         } else {
-          toolResults = toolCalls.map((call) => ({
+          toolResults = displayableToolCalls.map((call) => ({
             name: call.name,
             status: "pending" as const,
           }));
         }
 
         const planSummary = /<execution_plan\b[^>]*>([\s\S]*?)<\/execution_plan>/i.exec(msg.content)?.[1]?.trim() 
-          || `Executar ${toolCalls.length} ferramenta(s) MCP`;
-
-        const internalThoughts = msg.content
-          .replace(/<execution_plan\b[^>]*>([\s\S]*?)<\/execution_plan>/gi, "")
-          .replace(/<tool_call\b[^>]*\/>/gi, "")
-          .replace(/<tool_call\b[^>]*>[\s\S]*?<\/tool_call>/gi, "")
-          .trim();
+          || `Executar ${displayableToolCalls.length} ferramenta(s) MCP`;
 
         items.push({
           type: "execution_step",
           id: msg.id,
           planSummary,
-          toolCalls,
+          toolCalls: displayableToolCalls,
           toolResults,
-          internalThoughts: internalThoughts || undefined,
+          internalThoughts: undefined,
           timestamp: msg.timestamp,
         });
 
@@ -198,18 +204,34 @@ export function ChatContainer({
   agentRunningStatus,
   runningToolsState,
   approvalRequest,
+  currentSessionId,
+  devModeEnabled,
+  queuedInterventionCount,
   onApprovePlan,
   onRejectPlan,
   onCancelAgent,
+  onQueueAgentMessage,
+  budgetStats,
 }: ChatContainerProps) {
   const { t } = useI18n();
   const [inputText, setInputText] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesScrollRef = useRef<HTMLDivElement>(null);
+  const shouldStickToBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const statusLines = splitStatus(agentRunningStatus);
 
   const handleSend = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!inputText.trim() || isAgentRunning || approvalRequest) return;
+    if (!inputText.trim() || approvalRequest) return;
+
+    if (isAgentRunning) {
+      onQueueAgentMessage(inputText.trim());
+      setInputText("");
+      return;
+    }
+
+    shouldStickToBottomRef.current = true;
     void Promise.resolve(onSendMessage(inputText.trim())).catch((error: unknown) => {
       console.error("Erro ao enviar mensagem para o agente:", error);
     });
@@ -225,9 +247,20 @@ export function ChatContainer({
 
   const handleSuggestionClick = (suggestion: string) => {
     if (isAgentRunning || approvalRequest) return;
+    shouldStickToBottomRef.current = true;
     void Promise.resolve(onSendMessage(suggestion)).catch((error: unknown) => {
       console.error("Erro ao enviar sugestão para o agente:", error);
     });
+  };
+
+  const handleExportSession = (format: SessionExportFormat) => {
+    if (!currentSessionId) return;
+
+    try {
+      SessionExportService.exportCurrentSession(currentSessionId, format);
+    } catch (error) {
+      console.error("Erro ao exportar sessão:", error);
+    }
   };
 
   // Auto-resize textarea height as content changes
@@ -239,10 +272,20 @@ export function ChatContainer({
     }
   }, [inputText]);
 
-  // Scroll to bottom when messages change or running status changes
+  const handleMessagesScroll = () => {
+    const element = messagesScrollRef.current;
+    if (!element) return;
+
+    const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
+    shouldStickToBottomRef.current = distanceFromBottom < 96;
+  };
+
+  // Scroll only when the user is already near the bottom. Status polling must not steal scroll.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isAgentRunning, agentRunningStatus]);
+    if (shouldStickToBottomRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages, isAgentRunning, runningToolsState]);
 
   const suggestions = [
     {
@@ -264,7 +307,11 @@ export function ChatContainer({
   return (
     <div className="flex flex-col flex-1 h-full bg-[var(--theme-bg)] text-[var(--theme-text)] overflow-hidden">
       {/* Messages Timeline */}
-      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
+      <div
+        ref={messagesScrollRef}
+        onScroll={handleMessagesScroll}
+        className="flex-1 overflow-y-auto p-4 flex flex-col gap-4"
+      >
         {timelineItems.length === 0 ? (
           /* Empty/Welcome State */
           <motion.div
@@ -364,9 +411,16 @@ export function ChatContainer({
             transition={{ duration: 0.2 }}
             className="mx-4 mb-2 p-3 rounded-lg border border-[rgba(214,168,79,0.2)] bg-[rgba(20,16,10,0.9)] flex items-center justify-between text-xs text-[var(--theme-text)]"
           >
-            <div className="flex items-center gap-2.5">
+            <div className="flex items-start gap-2.5">
               <Loader2 className="w-4 h-4 animate-spin text-[var(--theme-primary)] shrink-0" />
-              <span className="font-mono">{agentRunningStatus}</span>
+              <span className="flex flex-col gap-1 font-mono">
+                <span>{statusLines.main}</span>
+                {statusLines.detail && (
+                  <span className="text-[10px] leading-relaxed text-[var(--theme-muted)]">
+                    {statusLines.detail}
+                  </span>
+                )}
+              </span>
             </div>
             <button
               onClick={onCancelAgent}
@@ -380,6 +434,63 @@ export function ChatContainer({
 
       {/* Input area */}
       <form onSubmit={handleSend} className="p-4 border-t border-[var(--theme-border)] bg-[rgba(15,11,6,0.3)]">
+        {devModeEnabled && (
+          <div className="mb-2 flex flex-col gap-2 rounded-lg border border-[rgba(214,168,79,0.16)] bg-[rgba(20,16,10,0.55)] px-3 py-2 text-[10px] text-[var(--theme-text)]">
+            <div className="flex items-center justify-between gap-2 border-b border-[rgba(214,168,79,0.1)] pb-1.5">
+              <div className="flex items-center gap-1">
+                <span className="font-bold uppercase tracking-wider text-[var(--theme-primary-light)]">{t.dev_mode_label}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleExportSession("json")}
+                  disabled={!currentSessionId}
+                  className="theme-secondary-button flex items-center gap-1 px-2 py-0.5 text-[9px]"
+                >
+                  <Download className="h-2.5 w-2.5" />
+                  JSON
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleExportSession("txt")}
+                  disabled={!currentSessionId}
+                  className="theme-secondary-button flex items-center gap-1 px-2 py-0.5 text-[9px]"
+                >
+                  <Download className="h-2.5 w-2.5" />
+                  TXT
+                </button>
+              </div>
+            </div>
+            
+            {budgetStats ? (
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 font-mono text-[9px] text-[var(--theme-muted)]">
+                <div>Requests: <span className="text-yellow-400 font-bold">{budgetStats.requestCount}</span></div>
+                <div>Tokens: <span className="text-yellow-400 font-bold">{budgetStats.totalTokens} / {budgetStats.maxTokens}</span></div>
+                {budgetStats.lastInputTokens !== undefined && budgetStats.lastOutputTokens !== undefined && (
+                  <div>Último I/O: <span className="text-cyan-400 font-bold">{budgetStats.lastInputTokens}</span> / <span className="text-purple-400 font-bold">{budgetStats.lastOutputTokens}</span></div>
+                )}
+                {budgetStats.lastTokensPerSecond !== undefined && (
+                  <div>Velocidade: <span className="text-green-400 font-bold">{budgetStats.lastTokensPerSecond} tok/s</span></div>
+                )}
+                {budgetStats.lastCompressedTool && (
+                  <>
+                    <div className="truncate">Tool: <span className="text-[var(--theme-primary-light)]">{budgetStats.lastCompressedTool}</span></div>
+                    <div>Comprimido: <span className="text-green-400 font-bold">{budgetStats.compressionRatio}% salvo</span> ({Math.round(budgetStats.rawSize / 102.4) / 10}KB → {Math.round(budgetStats.compressedSize / 102.4) / 10}KB)</div>
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className="text-[9px] text-[var(--theme-muted)] italic">Nenhuma estatística de consumo gravada ainda nesta tarefa.</div>
+            )}
+          </div>
+        )}
+        {isAgentRunning && !approvalRequest && (
+          <div className="mb-2 rounded-lg border border-[rgba(214,168,79,0.16)] bg-[rgba(20,16,10,0.45)] px-3 py-2 text-[10px] text-[var(--theme-muted)]">
+            {queuedInterventionCount > 0
+              ? t.chat_queued_intervention_count.replace("{count}", String(queuedInterventionCount))
+              : t.chat_queue_intervention_hint}
+          </div>
+        )}
         <div className="flex gap-2 relative items-end">
           <textarea
             ref={textareaRef}
@@ -388,17 +499,19 @@ export function ChatContainer({
             onChange={(e) => setInputText(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder={
-              isAgentRunning
-                ? t.chat_input_placeholder_running
-                : t.chat_input_placeholder
+              approvalRequest
+                ? t.status_awaiting_approval
+                : isAgentRunning
+                  ? t.chat_input_placeholder_queue
+                  : t.chat_input_placeholder
             }
-            disabled={isAgentRunning}
+            disabled={Boolean(approvalRequest)}
             className="input-neon text-sm flex-1 resize-none min-h-[38px] max-h-[140px] py-2 overflow-y-auto leading-normal animate-none"
             style={{ paddingRight: "48px" }}
           />
           <button
             type="submit"
-            disabled={isAgentRunning || Boolean(approvalRequest) || !inputText.trim()}
+            disabled={Boolean(approvalRequest) || !inputText.trim()}
             className="theme-primary-button w-8 h-8 absolute right-1.5 bottom-1.5 flex items-center justify-center rounded-lg aspect-square text-[var(--theme-on-primary)] shadow-none"
           >
             <Send className="w-4 h-4" />
@@ -407,4 +520,12 @@ export function ChatContainer({
       </form>
     </div>
   );
+}
+
+function splitStatus(status: string): { main: string; detail: string | null } {
+  const [main, ...details] = status.split("\n").map((line) => line.trim()).filter(Boolean);
+  return {
+    main: main || status,
+    detail: details.length > 0 ? details.join(" ") : null,
+  };
 }

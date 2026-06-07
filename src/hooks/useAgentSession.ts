@@ -8,6 +8,7 @@ import {
 } from "../services/storageService";
 import type { AgentExecutionPlan, ToolCallState } from "../services/agentLoop";
 import { useI18n, getBrowserLanguage } from "../i18n";
+import type { AiProvider } from "../config/aiModels";
 
 export interface ApprovalRequestState {
   plan: AgentExecutionPlan;
@@ -15,7 +16,7 @@ export interface ApprovalRequestState {
   pendingApproval: PendingApproval;
 }
 
-type Provider = "openai" | "gemini" | "ollama";
+type Provider = AiProvider;
 
 export function useAgentSession() {
   const { t } = useI18n();
@@ -38,6 +39,10 @@ export function useAgentSession() {
   );
   const [approvalRequest, setApprovalRequest] = useState<ApprovalRequestState | null>(() =>
     initialPendingApproval ? pendingToApprovalRequest(initialPendingApproval) : null,
+  );
+  const [budgetStats, setBudgetStats] = useState<AgentRuntimeState["budgetStats"]>(() => runtimeState.budgetStats);
+  const [queuedInterventionCount, setQueuedInterventionCount] = useState(() =>
+    StorageService.getPendingAgentInterventions(currentSessionId).length,
   );
   const lastLocalStartRef = useRef<{ sessionId: string; timestamp: number } | null>(null);
 
@@ -63,6 +68,7 @@ export function useAgentSession() {
     }
 
     const pendingApproval = StorageService.getPendingApproval(activeSessionId);
+    setQueuedInterventionCount(StorageService.getPendingAgentInterventions(activeSessionId).length);
 
     if (pendingApproval) {
       setApprovalRequest(pendingToApprovalRequest(pendingApproval));
@@ -76,6 +82,7 @@ export function useAgentSession() {
     setIsAgentRunning(state.status === "running" || state.status === "awaiting_approval");
     setAgentRunningStatus(state.message);
     setRunningToolsState(state.toolCalls);
+    setBudgetStats(state.budgetStats);
   }, [t.status_awaiting_approval]);
 
   const syncSessionsState = useCallback(() => {
@@ -101,6 +108,7 @@ export function useAgentSession() {
     }
 
     setCurrentSessionId(activeSessionId);
+    setQueuedInterventionCount(StorageService.getPendingAgentInterventions(activeSessionId).length);
     const session = StorageService.getSession(activeSessionId);
     if (session) {
       setProvider(session.provider);
@@ -198,8 +206,9 @@ export function useAgentSession() {
   const handleDeleteSession = useCallback((id: string) => {
     if (isAgentRunning || approvalRequest) return;
     StorageService.deleteSession(id);
+    setQueuedInterventionCount(StorageService.getPendingAgentInterventions(currentSessionId).length);
     syncSessionsState();
-  }, [approvalRequest, isAgentRunning, syncSessionsState]);
+  }, [approvalRequest, currentSessionId, isAgentRunning, syncSessionsState]);
 
   const handleCancelAgent = useCallback(() => {
     if (!currentSessionId) return;
@@ -317,6 +326,13 @@ export function useAgentSession() {
     }
   }, [applyRuntimeState, approvalRequest, currentSessionId, isAgentRunning, model, provider, syncSessionsState, t.status_agent_started]);
 
+  const handleQueueAgentMessage = useCallback((text: string) => {
+    if (!currentSessionId || !text.trim()) return;
+
+    StorageService.queueAgentIntervention(currentSessionId, text.trim());
+    setQueuedInterventionCount(StorageService.getPendingAgentInterventions(currentSessionId).length);
+  }, [currentSessionId]);
+
   const handleProviderChange = useCallback((newProvider: Provider) => {
     setProvider(newProvider);
     if (currentSessionId) {
@@ -347,6 +363,7 @@ export function useAgentSession() {
     agentRunningStatus,
     runningToolsState,
     approvalRequest,
+    queuedInterventionCount,
     syncSessionsState,
     handleSelectSession,
     handleNewSession,
@@ -355,8 +372,10 @@ export function useAgentSession() {
     handleApprovePlan,
     handleRejectPlan,
     handleSendMessage,
+    handleQueueAgentMessage,
     handleProviderChange,
     handleModelChange,
+    budgetStats,
   };
 }
 

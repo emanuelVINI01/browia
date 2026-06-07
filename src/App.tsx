@@ -6,6 +6,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { Settings, Menu, Cpu } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useI18n } from "./i18n";
+import { StorageService } from "./services/storageService";
 
 function App() {
   const { t } = useI18n();
@@ -18,6 +19,7 @@ function App() {
     agentRunningStatus,
     runningToolsState,
     approvalRequest,
+    queuedInterventionCount,
     syncSessionsState,
     handleSelectSession,
     handleNewSession,
@@ -26,12 +28,15 @@ function App() {
     handleApprovePlan,
     handleRejectPlan,
     handleSendMessage,
+    handleQueueAgentMessage,
     handleProviderChange,
     handleModelChange,
+    budgetStats,
   } = useAgentSession();
 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [devModeEnabled, setDevModeEnabled] = useState(() => Boolean(StorageService.getSettings().devModeEnabled));
 
   const currentSession = sessions.find((s) => s.id === currentSessionId);
   const activeMessages = currentSession ? currentSession.messages : [];
@@ -68,7 +73,7 @@ function App() {
           <span className="text-[var(--theme-border)]">|</span>
           <Cpu className="w-3.5 h-3.5 text-[var(--theme-primary)]" />
           <span className="font-mono font-medium text-[rgba(255,255,255,0.95)]">
-            {provider === "openai" ? "OpenAI" : provider === "gemini" ? "Gemini" : "Ollama"}: {model}
+            {provider === "openai" ? "OpenAI" : provider === "gemini" ? "Gemini" : provider === "groq" ? "Groq" : "Ollama"}: {model}
           </span>
         </div>
 
@@ -106,9 +111,14 @@ function App() {
           agentRunningStatus={agentRunningStatus}
           runningToolsState={runningToolsState}
           approvalRequest={approvalRequest}
+          currentSessionId={currentSessionId}
+          devModeEnabled={devModeEnabled}
+          queuedInterventionCount={queuedInterventionCount}
           onApprovePlan={handleApprovePlan}
           onRejectPlan={handleRejectPlan}
           onCancelAgent={handleCancelAgent}
+          onQueueAgentMessage={handleQueueAgentMessage}
+          budgetStats={budgetStats}
         />
 
         {/* Settings Overlay Modal */}
@@ -123,6 +133,7 @@ function App() {
               <SettingsPanel
                 onClose={() => {
                   setIsSettingsOpen(false);
+                  setDevModeEnabled(Boolean(StorageService.getSettings().devModeEnabled));
                   syncSessionsState();
                 }}
                 provider={provider}

@@ -263,6 +263,22 @@ async function getPageInventory(params: Record<string, string>): Promise<unknown
   const result = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
+      const ignoredTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "SVG", "IFRAME"]);
+      let vortexCounter = 1;
+      function traverse(element: Element) {
+        if (ignoredTags.has(element.tagName)) return;
+        if (!element.hasAttribute("data-vortex-id")) {
+          element.setAttribute("data-vortex-id", String(vortexCounter));
+        }
+        vortexCounter++;
+        for (const child of Array.from(element.children)) {
+          traverse(child);
+        }
+      }
+      if (document.body) {
+        traverse(document.body);
+      }
+
       const visible = (element: Element) => {
         const rect = element.getBoundingClientRect();
         const style = window.getComputedStyle(element);
@@ -284,7 +300,7 @@ async function getPageInventory(params: Record<string, string>): Promise<unknown
         name: element.getAttribute("name"),
         vortexId: element.getAttribute("data-vortex-id"),
       });
-      const elements = Array.from(document.querySelectorAll("*"));
+      const elements = Array.from(document.querySelectorAll("*")).filter(el => !ignoredTags.has(el.tagName));
 
       return {
         url: window.location.href,

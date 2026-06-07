@@ -1,54 +1,77 @@
 import type { ToolCall } from "./types";
 
 export function parseXmlCommands(aiOutput: string): ToolCall[] {
-  const matches: Array<{ index: number; call: ToolCall }> = [];
-  const selfClosingToolRegex = /<tool_call\b([^>]*)\/>/gi;
-  const toolBlockRegex = /<tool_call\b([^>]*)>([\s\S]*?)<\/tool_call>/gi;
+  const matches: ToolCall[] = [];
   const consumedRanges: Array<[number, number]> = [];
-  let toolMatch: RegExpExecArray | null;
+  
+  // 1. First parse self-closing tags
+  const selfClosingRegex = /<(tool_call|tool_calls|tool|function_call)\b([^>]*?)\/>/gi;
+  let match: RegExpExecArray | null;
+  
+  while ((match = selfClosingRegex.exec(aiOutput)) !== null) {
+    const start = match.index;
+    const end = selfClosingRegex.lastIndex;
+    consumedRanges.push([start, end]);
+    
+    const name = extractAttribute(match[2], "name");
+    if (name) {
+      matches.push({ name, params: {} });
+    }
+  }
 
-  while ((toolMatch = toolBlockRegex.exec(aiOutput)) !== null) {
-    consumedRanges.push([toolMatch.index, toolMatch.index + toolMatch[0].length]);
-    const name = extractAttribute(toolMatch[1], "name");
+  // 2. Parse paired/open tags (allows mismatched closures)
+  const openTagRegex = /<(tool_call|tool_calls|tool|function_call)\b([^>]*?)>/gi;
+  while ((match = openTagRegex.exec(aiOutput)) !== null) {
+    const start = match.index;
+    const openTagEnd = openTagRegex.lastIndex;
+    
+    const isInsideConsumed = consumedRanges.some(([rStart, rEnd]) => start >= rStart && start < rEnd);
+    if (isInsideConsumed) continue;
 
-    if (!name) {
-      continue;
+    const attributesStr = match[2];
+    const name = extractAttribute(attributesStr, "name");
+    if (!name) continue;
+
+    // Search for any of the valid closing tags
+    const closeTagRegex = /<\/(tool_call|tool_calls|tool|function_call)>/gi;
+    closeTagRegex.lastIndex = openTagEnd;
+    const closeMatch = closeTagRegex.exec(aiOutput);
+    
+    let content: string;
+    let end: number;
+    if (closeMatch) {
+      content = aiOutput.substring(openTagEnd, closeMatch.index);
+      end = closeMatch.index + closeMatch[0].length;
+    } else {
+      // Fallback: take content until next open tag or end of string if closure is missing
+      const nextOpenMatch = /<(tool_call|tool_calls|tool|function_call)\b/i.exec(aiOutput.substring(openTagEnd));
+      if (nextOpenMatch) {
+        content = aiOutput.substring(openTagEnd, openTagEnd + nextOpenMatch.index);
+        end = openTagEnd + nextOpenMatch.index;
+      } else {
+        content = aiOutput.substring(openTagEnd);
+        end = aiOutput.length;
+      }
     }
 
+    consumedRanges.push([start, end]);
+
+    // Parse parameters
     const params: Record<string, string> = {};
     const paramRegex = /<param\b([^>]*)>([\s\S]*?)<\/param>/gi;
     let paramMatch: RegExpExecArray | null;
 
-    while ((paramMatch = paramRegex.exec(toolMatch[2])) !== null) {
+    while ((paramMatch = paramRegex.exec(content)) !== null) {
       const paramName = extractAttribute(paramMatch[1], "name");
-
       if (paramName) {
         params[paramName] = decodeXmlText(unwrapCdata(paramMatch[2]).trim());
       }
     }
 
-    matches.push({ index: toolMatch.index, call: { name, params } });
+    matches.push({ name, params });
   }
 
-  while ((toolMatch = selfClosingToolRegex.exec(aiOutput)) !== null) {
-    const start = toolMatch.index;
-    const end = start + toolMatch[0].length;
-    const isInsidePairedBlock = consumedRanges.some(
-      ([rangeStart, rangeEnd]) => start >= rangeStart && end <= rangeEnd,
-    );
-
-    if (isInsidePairedBlock) {
-      continue;
-    }
-
-    const name = extractAttribute(toolMatch[1], "name");
-
-    if (name) {
-      matches.push({ index: start, call: { name, params: {} } });
-    }
-  }
-
-  return matches.sort((a, b) => a.index - b.index).map((match) => match.call);
+  return matches;
 }
 
 function extractAttribute(source: string, name: string): string | null {

@@ -6,7 +6,7 @@ export class OpenaiService {
     model: string,
     systemPrompt: string,
     history: Message[]
-  ): Promise<string> {
+  ): Promise<{ text: string; inputTokens?: number; outputTokens?: number }> {
     if (!apiKey) {
       throw new Error("Chave de API do OpenAI não configurada.");
     }
@@ -40,6 +40,11 @@ export class OpenaiService {
     }
 
     const data = await response.json();
-    return data.choices[0]?.message?.content || "";
+    const usage = data.usage;
+    return {
+      text: data.choices[0]?.message?.content || "",
+      inputTokens: usage?.prompt_tokens,
+      outputTokens: usage?.completion_tokens,
+    };
   }
 }

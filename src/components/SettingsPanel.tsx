@@ -26,7 +26,7 @@ interface SettingsPanelProps {
   onModelChange: (model: string) => void;
 }
 
-type SettingsTab = "api" | "google" | "general" | "language" | "prompt";
+type SettingsTab = "api" | "models" | "general" | "language" | "prompt";
 
 export function SettingsPanel({
   onClose,
@@ -46,15 +46,14 @@ export function SettingsPanel({
   const [isWarningModalOpen, setIsWarningModalOpen] = useState(false);
 
   const tabs = useMemo<SettingsTabItem[]>(() => {
-    const providerLabel = provider === "openai" ? "OpenAI" : provider === "gemini" ? "Gemini" : "Ollama";
     return [
       { id: "api", label: t.settings_tab_api, icon: KeyRound },
-      { id: "google", label: providerLabel, icon: Sparkles },
+      { id: "models", label: t.settings_tab_models, icon: Sparkles },
       { id: "general", label: t.settings_tab_general, icon: ShieldAlert },
       { id: "language", label: t.settings_tab_language, icon: Languages },
       { id: "prompt", label: t.settings_tab_prompt, icon: MessageSquareText },
     ];
-  }, [t.settings_tab_api, t.settings_tab_general, t.settings_tab_language, t.settings_tab_prompt, provider]);
+  }, [t.settings_tab_api, t.settings_tab_general, t.settings_tab_language, t.settings_tab_models, t.settings_tab_prompt]);
 
   const fetchOllamaModels = useCallback(async (endpoint: string) => {
     setLoadingOllama(true);
@@ -188,7 +187,7 @@ export function SettingsPanel({
             />
           )}
 
-          {activeTab === "google" && (
+          {activeTab === "models" && (
             <ModelSettingsSection
               provider={provider}
               model={model}

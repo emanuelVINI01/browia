@@ -9,8 +9,37 @@ export async function resolveTabId(tabId?: string): Promise<number> {
     }
   }
 
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  const activeTabId = tabs[0]?.id;
+  const hasTabs = typeof chrome !== "undefined" && typeof chrome.tabs !== "undefined";
+  const hasScripting = typeof chrome !== "undefined" && typeof chrome.scripting !== "undefined";
+  console.log(`[Browia resolveTabId] Requesting tab resolution. chrome.tabs: ${hasTabs}, chrome.scripting: ${hasScripting}`);
+
+  if (typeof chrome === "undefined" || !chrome.tabs) {
+    if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
+      console.log("[Browia resolveTabId] chrome.tabs is unavailable. Dispatching RESOLVE_ACTIVE_TAB_ID to background...");
+      const bgResponse = await chrome.runtime.sendMessage({
+        type: "RESOLVE_ACTIVE_TAB_ID"
+      });
+
+      const resolvedTabId = bgResponse?.result?.tabId ?? bgResponse?.tabId;
+
+      if (bgResponse?.ok && typeof resolvedTabId === "number") {
+        console.log(`[Browia resolveTabId] Background successfully resolved active tab: ${resolvedTabId}`);
+        return resolvedTabId;
+      } else {
+        throw new Error(bgResponse?.error || "Failed to resolve active tab from background.");
+      }
+    }
+    throw new Error("chrome.tabs API is not available. If you recently updated the manifest permissions, please reload the extension in chrome://extensions.");
+  }
+
+  let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (!tabs || tabs.length === 0) {
+    tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  }
+  if (!tabs || tabs.length === 0) {
+    tabs = await chrome.tabs.query({ active: true });
+  }
+  const activeTabId = tabs?.[0]?.id;
 
   if (typeof activeTabId !== "number") {
     throw new Error("No active tab found.");
