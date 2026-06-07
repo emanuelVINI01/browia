@@ -184,9 +184,10 @@ export class AgentLoop {
 
     // Initialize TokenBudgetManager (Parte 8)
     const budgetManager = new TokenBudgetManager(provider);
-    const maxIterations = 12; // safety limit
 
-    for (let iter = 0; iter < maxIterations; iter++) {
+    let iter = 0;
+    while (true) {
+      iter++;
       if (signal?.aborted) {
         onUpdate({ type: "cancelled", message: "Execução cancelada pelo usuário." });
         throw new Error("Cancelled");
@@ -225,7 +226,7 @@ export class AgentLoop {
       }
 
       const stats = budgetManager.getStats();
-      onUpdate({ type: "ai_thinking", message: `A IA está pensando (passo ${iter + 1})...` });
+      onUpdate({ type: "ai_thinking", message: `A IA está pensando (passo ${iter})...` });
 
       // Build compact model context (Parte 14)
       const compactHistory = this.buildAgentModelContext(
@@ -280,7 +281,7 @@ export class AgentLoop {
       }
 
       // Record input and output tokens
-      console.log(`[Browia API Tokens - Main Loop] Iteration: ${iter + 1}, Provider: ${provider}, Model: ${model}, Input: ${responseRes.inputTokens ?? 0}, Output: ${responseRes.outputTokens ?? 0}, Total: ${(responseRes.inputTokens ?? 0) + (responseRes.outputTokens ?? 0)}, Speed: ${responseRes.tokensPerSecond ?? 0} tok/s`);
+      console.log(`[Browia API Tokens - Main Loop] Iteration: ${iter}, Provider: ${provider}, Model: ${model}, Input: ${responseRes.inputTokens ?? 0}, Output: ${responseRes.outputTokens ?? 0}, Total: ${(responseRes.inputTokens ?? 0) + (responseRes.outputTokens ?? 0)}, Speed: ${responseRes.tokensPerSecond ?? 0} tok/s`);
       const promptForEstimation = `${systemPrompt}\n\n${JSON.stringify(compactHistory)}`;
       const callTokens = budgetManager.recordCall(promptForEstimation, responseText, responseRes.inputTokens, responseRes.outputTokens);
 
@@ -291,7 +292,7 @@ export class AgentLoop {
         kind: "provider" as const,
         provider,
         model,
-        iteration: iter + 1,
+        iteration: iter,
         inputTokens: callTokens.inputTokens,
         outputTokens: callTokens.outputTokens,
         totalTokens: callTokens.inputTokens + callTokens.outputTokens,
@@ -326,7 +327,7 @@ export class AgentLoop {
         phase: "model_response",
         message: toolCalls.length > 0 ? "Modelo emitiu XML MCP." : "Modelo respondeu sem XML MCP.",
         data: {
-          iteration: iter + 1,
+          iteration: iter,
           toolCalls: toolCalls.map((call) => call.name),
           responsePreview: this.truncateForPrompt(responseText, 1200),
         },
@@ -378,7 +379,7 @@ export class AgentLoop {
           phase: "unsafe_action_bootstrap",
           message: "Modelo tentou agir sem contexto de aba; executando get_tab_info antes.",
           data: {
-            iteration: iter + 1,
+            iteration: iter,
             blockedTools: toolCalls.map((call) => call.name),
           },
         });
@@ -583,9 +584,6 @@ export class AgentLoop {
       }
     }
 
-    const maxError = "Limite de iterações do agente atingido sem resposta final.";
-    onUpdate({ type: "error", message: maxError });
-    throw new Error(maxError);
   }
 
   static async resumePendingApproval(
