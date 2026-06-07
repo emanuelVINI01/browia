@@ -470,7 +470,7 @@ export function ChatContainer({
             {budgetStats ? (
               <div className="grid grid-cols-2 gap-x-4 gap-y-1 font-mono text-[9px] text-[var(--theme-muted)]">
                 <div>Requests: <span className="text-yellow-400 font-bold">{budgetStats.requestCount}</span></div>
-                <div>Tokens: <span className="text-yellow-400 font-bold">{budgetStats.totalTokens} / {budgetStats.maxTokens}</span></div>
+                <div>Tokens: <span className="text-yellow-400 font-bold">{budgetStats.totalTokens}</span></div>
                 {budgetStats.lastInputTokens !== undefined && budgetStats.lastOutputTokens !== undefined && (
                   <div>Último I/O: <span className="text-cyan-400 font-bold">{budgetStats.lastInputTokens}</span> / <span className="text-purple-400 font-bold">{budgetStats.lastOutputTokens}</span></div>
                 )}

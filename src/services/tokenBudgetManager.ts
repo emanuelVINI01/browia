@@ -1,8 +1,6 @@
 export interface ProviderBudget {
   maxInputTokensPerCall: number;
   maxOutputTokensPerCall: number;
-  maxTokensPerTask: number;
-  maxRequestsPerTask: number;
   maxStepsPerTask: number;
   minDelayBetweenRequestsMs?: number;
 }
@@ -11,30 +9,22 @@ export const PROVIDER_BUDGETS: Record<string, ProviderBudget> = {
   openai: {
     maxInputTokensPerCall: 25000,
     maxOutputTokensPerCall: 800,
-    maxTokensPerTask: 60000,
-    maxRequestsPerTask: 10,
     maxStepsPerTask: 10,
   },
   groq: {
     maxInputTokensPerCall: 8000,
     maxOutputTokensPerCall: 300,
-    maxTokensPerTask: 20000,
-    maxRequestsPerTask: 6,
     maxStepsPerTask: 8,
   },
   gemini: {
     maxInputTokensPerCall: 30000,
     maxOutputTokensPerCall: 500,
-    maxTokensPerTask: 80000,
-    maxRequestsPerTask: 8,
     maxStepsPerTask: 8,
     minDelayBetweenRequestsMs: 4000,
   },
   ollama: {
     maxInputTokensPerCall: 4000,
     maxOutputTokensPerCall: 200,
-    maxTokensPerTask: 12000,
-    maxRequestsPerTask: 5,
     maxStepsPerTask: 5,
   },
 };
@@ -74,12 +64,7 @@ export class TokenBudgetManager {
   }
 
   isBudgetExceeded(upcomingInputLength?: number): { exceeded: boolean; reason?: string } {
-    const budget = this.getBudget();
-    const estNextInput = upcomingInputLength ? this.estimateTokens(String(upcomingInputLength)) : 0;
-    
-    if (this.totalInputTokens + this.totalOutputTokens + this.totalToolResultTokens + estNextInput > budget.maxTokensPerTask) {
-      return { exceeded: true, reason: `Excedido limite de tokens por tarefa (${budget.maxTokensPerTask}).` };
-    }
+    void upcomingInputLength;
     return { exceeded: false };
   }
 

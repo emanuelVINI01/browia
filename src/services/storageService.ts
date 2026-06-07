@@ -84,7 +84,6 @@ export interface AgentRuntimeState {
   budgetStats?: {
     totalTokens: number;
     requestCount: number;
-    maxTokens: number;
     rawSize: number;
     compressedSize: number;
     compressionRatio: number;

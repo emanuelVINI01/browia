@@ -1181,7 +1181,8 @@ export class AgentLoop {
     callEntry?: NonNullable<NonNullable<AgentRuntimeState["budgetStats"]>["callHistory"]>[number],
   ): void {
     const currentRuntime = StorageService.getAgentRuntimeState();
-    const previousBudgetStats = currentRuntime.budgetStats;
+    const sameSession = currentRuntime.sessionId === sessionId;
+    const previousBudgetStats = sameSession ? currentRuntime.budgetStats : undefined;
     const previousHistory = previousBudgetStats?.callHistory ?? [];
     const callHistory = callEntry ? [...previousHistory, callEntry].slice(-50) : previousHistory;
 
@@ -1192,7 +1193,6 @@ export class AgentLoop {
         ...previousBudgetStats,
         totalTokens: stats.totalTokens,
         requestCount: stats.requestCount,
-        maxTokens: stats.budget.maxTokensPerTask,
         rawSize: previousBudgetStats?.rawSize ?? 0,
         compressedSize: previousBudgetStats?.compressedSize ?? 0,
         compressionRatio: previousBudgetStats?.compressionRatio ?? 0,
