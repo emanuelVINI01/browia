@@ -132,6 +132,11 @@ function buildTimelineItems(
             };
           });
         } else {
+          if (!isAgentRunning) {
+            items.push({ type: "message", message: msg });
+            continue;
+          }
+
           toolResults = displayableToolCalls.map((call) => ({
             name: call.name,
             status: "pending" as const,

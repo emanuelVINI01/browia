@@ -182,73 +182,6 @@ export class AgentLoop {
       throw new Error(`Sessão não encontrada: ${sessionId}`);
     }
 
-    // Nível 0: Casual Chat bypass (Parte 1 / Nível 0)
-    const requiresBrowserTool = this.shouldRequireBrowserTool(session.messages);
-    if (!requiresBrowserTool) {
-      onUpdate({ type: "ai_thinking", message: "Pensando na resposta..." });
-      try {
-        const casualSystemPrompt = "Você é o Browia, um assistente de IA amigável instalado no navegador. Responda à pergunta do usuário diretamente, sem usar ferramentas, de forma curta e simpática.";
-        const responseRes = await this.sendProviderMessage(
-          provider,
-          model,
-          casualSystemPrompt,
-          session.messages,
-          { openaiApiKey, geminiApiKey, groqApiKey, ollamaEndpoint },
-          {},
-          signal
-        );
-        console.log(`[Browia API Tokens - Casual Chat] Provider: ${provider}, Model: ${model}, Input: ${responseRes.inputTokens ?? 0}, Output: ${responseRes.outputTokens ?? 0}, Total: ${(responseRes.inputTokens ?? 0) + (responseRes.outputTokens ?? 0)}, Speed: ${responseRes.tokensPerSecond ?? 0} tok/s`);
-        const budgetManager = new TokenBudgetManager(provider);
-        const callTokens = budgetManager.recordCall(
-          `${casualSystemPrompt}\n\n${JSON.stringify(session.messages)}`,
-          responseRes.text,
-          responseRes.inputTokens,
-          responseRes.outputTokens,
-        );
-        const stats = budgetManager.getStats();
-        const providerCallEntry = {
-          sequence: stats.requestCount,
-          kind: "provider" as const,
-          provider,
-          model,
-          inputTokens: callTokens.inputTokens,
-          outputTokens: callTokens.outputTokens,
-          totalTokens: callTokens.inputTokens + callTokens.outputTokens,
-          tokensPerSecond: responseRes.tokensPerSecond,
-          estimated: responseRes.inputTokens === undefined || responseRes.outputTokens === undefined,
-          timestamp: new Date().toISOString(),
-        };
-        this.updateRuntimeBudgetStats(sessionId, stats, {
-          lastInputTokens: callTokens.inputTokens,
-          lastOutputTokens: callTokens.outputTokens,
-          lastTokensPerSecond: responseRes.tokensPerSecond,
-        }, providerCallEntry);
-        this.logDebug({
-          sessionId,
-          provider,
-          model,
-          phase: "provider_token_usage",
-          message: `Consumo de tokens da chamada ${stats.requestCount}.`,
-          data: providerCallEntry,
-        });
-        this.logDebug({
-          sessionId,
-          provider,
-          model,
-          phase: "casual_chat_response",
-          message: "Resposta do Casual Chat",
-          data: providerCallEntry,
-        });
-        this.appendFinalAssistantMessage(sessionId, responseRes.text);
-        onUpdate({ type: "final_answer", finalContent: responseRes.text });
-        return responseRes.text;
-      } catch (err: unknown) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        onUpdate({ type: "error", message: `Erro na chamada de IA: ${errMsg}` });
-        throw err;
-      }
-    }
-
     // Initialize TokenBudgetManager (Parte 8)
     const budgetManager = new TokenBudgetManager(provider);
     const maxIterations = 12; // safety limit
@@ -394,7 +327,6 @@ export class AgentLoop {
         message: toolCalls.length > 0 ? "Modelo emitiu XML MCP." : "Modelo respondeu sem XML MCP.",
         data: {
           iteration: iter + 1,
-          requiresBrowserTool,
           toolCalls: toolCalls.map((call) => call.name),
           responsePreview: this.truncateForPrompt(responseText, 1200),
         },
@@ -402,16 +334,11 @@ export class AgentLoop {
 
       if (finalAnswerCall && toolCalls.every((call) => call.name === "final_answer")) {
         const finalContent = this.extractFinalAnswer(finalAnswerCall);
-        const completion: TaskCompletionCheck = requiresBrowserTool
-          ? await this.evaluateTaskCompletion({
-              originalUserRequest,
-              responseText: finalContent,
-              executedSteps: executedStepsAtIterationStart,
-            })
-          : {
-              completed: finalContent.length > 0,
-              reason: "Resposta final emitida pela ferramenta final_answer.",
-            };
+        const completion = await this.evaluateTaskCompletion({
+          originalUserRequest,
+          responseText: finalContent,
+          executedSteps: executedStepsAtIterationStart,
+        });
 
         if (!completion.completed) {
           onUpdate({
@@ -438,8 +365,7 @@ export class AgentLoop {
       }
 
       const hasTabContext = executedStepsAtIterationStart.some((step) => step.tool === "get_tab_info" && step.status === "success");
-      const triesMutationWithoutTabContext = requiresBrowserTool
-        && !hasTabContext
+      const triesMutationWithoutTabContext = !hasTabContext
         && !toolCalls.some((call) => call.name === "get_tab_info")
         && toolCalls.some((call) => this.isMutatingTool(call.name));
 
@@ -526,63 +452,10 @@ export class AgentLoop {
         continue;
       }
 
-      if (toolCalls.length === 0 && requiresBrowserTool) {
-        const recoveryCount = this.countMcpFormatCorrections(currentSession.messages);
-        const isRecipeKnown = activeTabUrl ? Boolean(SITE_RECIPES[new URL(activeTabUrl).hostname.replace("www.", "") as keyof typeof SITE_RECIPES]) : false;
-        const bootstrapTool = this.getBrowserBootstrapTool(executedStepsAtIterationStart, isRecipeKnown);
-
-        this.logDebug({
-          sessionId,
-          provider,
-          model,
-          phase: "missing_mcp_recovery",
-          message: bootstrapTool
-            ? `Modelo sem MCP; executando bootstrap seguro ${bootstrapTool.name}.`
-            : "Modelo sem MCP; adicionando instrucao interna curta.",
-          data: {
-            iteration: iter + 1,
-            recoveryCount,
-            bootstrapTool: bootstrapTool?.name,
-          },
-        });
-
-        if (recoveryCount > 0 && bootstrapTool) {
-          const bootstrapResponse = `<execution_plan>Obter contexto minimo da aba ativa para destravar o proximo passo MCP.</execution_plan>\n${this.renderToolCallXml(bootstrapTool)}`;
-          const bootstrapStates: ToolCallState[] = [{ name: bootstrapTool.name, params: {}, status: "pending" }];
-          const bootstrapSteps = await this.executeApprovedToolCalls(
-            sessionId,
-            bootstrapResponse,
-            [bootstrapTool],
-            bootstrapStates,
-            onUpdate,
-            budgetManager,
-            activeTabUrl,
-            signal,
-            { recordAssistantMessage: true },
-          );
-          this.appendInternalContinuationPrompt(
-            sessionId,
-            originalUserRequest,
-            [...executedStepsAtIterationStart, ...bootstrapSteps],
-            `O modelo respondeu sem XML MCP. O runtime executou ${bootstrapTool.name} para fornecer contexto minimo.`,
-            responseText,
-          );
-          continue;
-        }
-
-        onUpdate({
-          type: "ai_thinking",
-          message: "A IA respondeu sem ferramenta; registrando correção MCP...",
-        });
-
-        this.appendMcpFormatCorrectionPrompt(sessionId, originalUserRequest, responseText);
-        continue;
-      }
-
       if (toolCalls.length === 0) {
         const cleanedResponse = responseText.trim();
 
-        if (!requiresBrowserTool && cleanedResponse) {
+        if (cleanedResponse) {
           this.appendFinalAssistantMessage(sessionId, cleanedResponse);
           onUpdate({ type: "final_answer", finalContent: cleanedResponse });
           return cleanedResponse;
@@ -597,7 +470,7 @@ export class AgentLoop {
           sessionId,
           originalUserRequest,
           executedStepsAtIterationStart,
-          "A intencao foi classificada como browser; texto comum sem tool MCP nao e uma acao valida.",
+          "O modelo respondeu vazio; precisa responder ao usuario ou emitir a proxima ferramenta MCP.",
           cleanedResponse,
         );
         continue;
@@ -744,9 +617,7 @@ export class AgentLoop {
 
         onUpdate({
           type: "ai_thinking",
-          message: completion.completed
-            ? "Validando resposta final..."
-            : this.describeNextRuntimeStatus(originalUserRequest, allExecutedSteps),
+          message: completion.completed ? "Validando resposta final..." : "Avaliando próximo passo...",
         });
 
         this.appendInternalContinuationPrompt(
@@ -945,14 +816,6 @@ export class AgentLoop {
     };
   }
 
-  private static shouldRequireBrowserTool(messages: Message[]): boolean {
-    const latestUserMessage = this.getOriginalUserRequest(messages);
-    const browserTaskPattern =
-      /\b(site|url|aba|pagina|página|dom|html|clique|clica|clicar|foto|avatar|perfil|conta|nome|elemento|bot[aã]o|campo|digite|preencha|pesquisa|pesquise|buscar|busca|procura|google|resultado|screenshot|print|download|cookie|favorito|hist[oó]rico|localstorage|sessionstorage|canal|channel|v[ií]deo|videos|vídeos|post|posts|postei|tiktok|youtube|shorts|reels)\b/i;
-
-    return browserTaskPattern.test(latestUserMessage);
-  }
-
   private static getOriginalUserRequest(messages: Message[]): string {
     return [...messages]
       .reverse()
@@ -987,109 +850,18 @@ export class AgentLoop {
     executedSteps: ExecutedStep[];
     lastToolResult?: ExecutedStep;
   }): Promise<TaskCompletionCheck> {
-    const request = input.originalUserRequest.toLowerCase();
     const finalText = (input.responseText ?? "").trim();
-    const steps = input.executedSteps;
 
-    if (!request) {
-      return { completed: Boolean(finalText), reason: "Sem objetivo original rastreavel." };
-    }
-
-    if (this.isScreenshotOrDownloadTask(request)) {
-      const hasFileAction = steps.some((step) =>
-        ["download_file", "download_screenshot"].includes(step.tool)
-        || (step.tool === "capture_screenshot" && !/\b(baix|download|salv|arquivo)\b/i.test(request))
-      );
+    if (finalText) {
       return {
-        completed: hasFileAction && this.hasUsefulFinalAnswer(finalText),
-        reason: hasFileAction
-          ? "Arquivo/captura ja foi gerado; falta apenas informar conclusao ao usuario."
-          : "Objetivo pede arquivo/captura, mas nenhuma ferramenta de captura/download foi concluida.",
+        completed: this.hasUsefulFinalAnswer(finalText),
+        reason: "O modelo emitiu resposta final; o runtime valida apenas que o texto nao esteja vazio nem contenha XML MCP aninhado.",
       };
-    }
-
-    if (this.isSearchTask(request)) {
-      const typedIndex = this.findLastStepIndex(steps, (step) =>
-        step.tool === "interact_element"
-        && step.params.action === "type"
-        && Boolean(step.params.value?.trim())
-      );
-      let submittedIndex = this.findLastStepIndex(steps, (step) =>
-        (step.tool === "press_key" && /^enter$/i.test(step.params.key ?? ""))
-        || (step.tool === "interact_element" && step.params.action === "click" && this.looksLikeSearchSubmit(step.params))
-        || (step.tool === "navigate_tab" && /[?&](q|query|search)=/i.test(step.params.url ?? ""))
-        || step.tool === "search_web"
-      );
-      if (submittedIndex < 0 && typedIndex >= 0) {
-        submittedIndex = this.findLastStepIndex(steps, (step) =>
-          ["interact_element", "interact_cached_element"].includes(step.tool) && step.params.action === "click"
-        );
-        if (submittedIndex < typedIndex) {
-          submittedIndex = -1;
-        }
-      }
-      const readAfterSubmit = submittedIndex >= 0 && steps.some((step, index) =>
-        index > submittedIndex && this.isReadTool(step.tool)
-      );
-
-      if (typedIndex >= 0 && submittedIndex < 0) {
-        return { completed: false, reason: "A pesquisa foi digitada, mas ainda nao foi submetida." };
-      }
-
-      if (submittedIndex >= 0 && !readAfterSubmit && !steps.some((step) => step.tool === "search_web")) {
-        return { completed: false, reason: "A pesquisa foi enviada, mas os resultados ainda nao foram aguardados/lidos." };
-      }
-
-      return {
-        completed: (steps.some((step) => step.tool === "search_web") || readAfterSubmit) && this.hasUsefulFinalAnswer(finalText),
-        reason: "Pesquisa exige submeter, ler resultados e responder ao usuario com resumo util.",
-      };
-    }
-
-    if (this.isClickExtractionTask(request)) {
-      const clickIndex = this.findLastStepIndex(steps, (step) =>
-        ["interact_element", "interact_cached_element"].includes(step.tool) && step.params.action === "click"
-      );
-      const readAfterClick = clickIndex >= 0 && steps.some((step, index) =>
-        index > clickIndex && this.isReadTool(step.tool)
-      );
-
-      if (clickIndex >= 0 && !readAfterClick) {
-        return { completed: false, reason: "O clique foi executado, mas o estado resultante ainda nao foi lido." };
-      }
-
-      return {
-        completed: readAfterClick && this.hasUsefulFinalAnswer(finalText),
-        reason: "A tarefa pede clique seguido de extracao; e preciso ler o modal/pagina apos o clique e responder.",
-      };
-    }
-
-    if (this.isFillOnlyTask(request)) {
-      const filled = steps.some((step) =>
-        ["interact_element", "interact_cached_element"].includes(step.tool)
-        && ["type", "clear"].includes(step.params.action ?? "")
-      );
-      return {
-        completed: filled && this.hasUsefulFinalAnswer(finalText),
-        reason: filled
-          ? "Formulario foi preenchido; falta confirmar ao usuario."
-          : "Pedido de preenchimento ainda nao executou digitacao/limpeza.",
-      };
-    }
-
-    const lastMutationIndex = this.findLastStepIndex(steps, (step) => this.isMutatingTool(step.tool));
-    const readAfterMutation = lastMutationIndex >= 0 && steps.some((step, index) =>
-      index > lastMutationIndex && this.isReadTool(step.tool)
-    );
-    const asksForInformation = /\b(qual|quais|quem|onde|quando|pega|extra(i|í)|ler|l[eê]|mostra|nome|resultado|informa|descobre)\b/i.test(request);
-
-    if (asksForInformation && lastMutationIndex >= 0 && !readAfterMutation) {
-      return { completed: false, reason: "Houve acao no navegador, mas a informacao resultante ainda nao foi lida." };
     }
 
     return {
-      completed: this.hasUsefulFinalAnswer(finalText),
-      reason: "Resposta final so e valida quando explica o resultado do objetivo original, nao apenas a ferramenta executada.",
+      completed: false,
+      reason: "Ferramentas foram executadas. Decida pelo objetivo original e pelos resultados se deve chamar mais uma ferramenta MCP ou emitir final_answer.",
     };
   }
 
@@ -1127,68 +899,11 @@ export class AgentLoop {
         "Pergunta obrigatoria: a tarefa do usuario ja foi concluida de ponta a ponta?",
         "Se NAO, escolha a proxima acao emitindo <tool_call>. Nao responda em texto comum.",
         "Se SIM, responda ao usuario com uma resposta final util, concreta e curta.",
-        "Heuristicas obrigatorias: pesquisa precisa submeter a busca, aguardar/ler resultados e responder; clique para extrair informacao precisa ler o estado apos o clique; preencher formulario so envia com aprovacao explicita do usuario.",
+        "O runtime nao classifica a tarefa por regex. Use seu proprio entendimento do objetivo, do estado conhecido e dos resultados das ferramentas.",
       ].filter(Boolean).join("\n"),
       timestamp: new Date().toISOString(),
     });
     StorageService.saveSession(session);
-  }
-
-  private static appendMcpFormatCorrectionPrompt(
-    sessionId: string,
-    originalUserRequest: string,
-    invalidResponse: string,
-  ): void {
-    const session = StorageService.getSession(sessionId);
-    if (!session) {
-      return;
-    }
-
-    session.messages.push({
-      id: crypto.randomUUID(),
-      role: "assistant",
-      internal: true,
-      content: this.truncateForPrompt(invalidResponse, 1800),
-      timestamp: new Date().toISOString(),
-    });
-    session.messages.push({
-      id: crypto.randomUUID(),
-      role: "user",
-      internal: true,
-      content: [
-        "[CORRECAO INTERNA MCP - NAO MOSTRAR AO USUARIO]",
-        "A resposta anterior nao contem nenhum bloco <tool_call> valido.",
-        `Objetivo original do usuario: ${originalUserRequest}`,
-        "Se a tarefa depende da aba atual, responda agora somente com XML MCP.",
-        "Formato minimo valido:",
-        "<execution_plan>plano curto</execution_plan>",
-        "<tool_call name=\"get_tab_info\"/>",
-        "Nao use markdown, codigo Python, tool_code, JSON solto nem texto comum.",
-      ].join("\n"),
-      timestamp: new Date().toISOString(),
-    });
-    StorageService.saveSession(session);
-  }
-
-  private static countMcpFormatCorrections(messages: Message[]): number {
-    return messages.filter((message) =>
-      message.internal
-      && message.role === "user"
-      && message.content.includes("[CORRECAO INTERNA MCP")
-    ).length;
-  }
-
-  private static getBrowserBootstrapTool(steps: ExecutedStep[], isRecipeKnown = false): ToolCall | null {
-    if (!steps.some((step) => step.tool === "get_tab_info")) {
-      return { name: "get_tab_info", params: {} };
-    }
-
-    // Do NOT bootstrap get_page_inventory if a recipe is already known!
-    if (!isRecipeKnown && !steps.some((step) => step.tool === "get_page_inventory") && !steps.some((step) => step.tool === "query_elements")) {
-      return { name: "get_page_inventory", params: { limit: "25" } };
-    }
-
-    return null;
   }
 
   private static renderToolCallXml(call: ToolCall): string {
@@ -1210,6 +925,10 @@ export class AgentLoop {
 
       if (name === "navigate_to" || name === "open_url") {
         name = "navigate_tab";
+      }
+
+      if (name === "read_page") {
+        name = "extract_page_text";
       }
 
       if (name === "interact_element" && params.value === undefined && params.text !== undefined) {
@@ -1361,25 +1080,6 @@ export class AgentLoop {
     };
   }
 
-  private static isSearchTask(request: string): boolean {
-    return /\b(pesquis|buscar|busca|procura|google|resultado|search)\b/i.test(request);
-  }
-
-  private static isClickExtractionTask(request: string): boolean {
-    return /\b(clic|abre|abrir|toca)\b/i.test(request)
-      && /\b(pega|extra(i|í)|ler|l[eê]|mostra|nome|texto|info|informacao|informação|resultado|modal|popup)\b/i.test(request);
-  }
-
-  private static isScreenshotOrDownloadTask(request: string): boolean {
-    return /\b(screenshot|print|captura|baix|download|arquivo)\b/i.test(request);
-  }
-
-  private static isFillOnlyTask(request: string): boolean {
-    const asksFill = /\b(preench|digita|escrev|coloca|insere)\b/i.test(request);
-    const asksSubmit = /\b(enviar|submeter|submit|confirmar|comprar|publicar|salvar|pesquis|buscar)\b/i.test(request);
-    return asksFill && !asksSubmit;
-  }
-
   private static isReadTool(tool: string): boolean {
     return [
       "get_tab_info",
@@ -1412,31 +1112,9 @@ export class AgentLoop {
     ].includes(tool);
   }
 
-  private static findLastStepIndex(steps: ExecutedStep[], predicate: (step: ExecutedStep) => boolean): number {
-    for (let index = steps.length - 1; index >= 0; index--) {
-      if (predicate(steps[index])) {
-        return index;
-      }
-    }
-    return -1;
-  }
-
   private static hasUsefulFinalAnswer(text: string): boolean {
-    if (!text || McpEngine.parseXmlCommands(text).length > 0) {
-      return false;
-    }
-
     const compact = text.replace(/\s+/g, " ").trim();
-    if (compact.length < 24) {
-      return false;
-    }
-
-    return !/\b(vou|irei|tentarei|preciso|posso tentar|executando|digitando|clicando|navegando)\b/i.test(compact);
-  }
-
-  private static looksLikeSearchSubmit(params: Record<string, string>): boolean {
-    const haystack = Object.values(params).join(" ").toLowerCase();
-    return /\b(search|pesquis|buscar|busca|google|submit|lupa)\b/i.test(haystack);
+    return compact.length > 0 && McpEngine.parseXmlCommands(compact).length === 0;
   }
 
   private static summarizeExecutedSteps(steps: ExecutedStep[]): string {
@@ -1572,24 +1250,6 @@ export class AgentLoop {
     return `${call.name} concluída. Verificando próximo passo...`;
   }
 
-  private static describeNextRuntimeStatus(originalUserRequest: string, steps: ExecutedStep[]): string {
-    const request = originalUserRequest.toLowerCase();
-    if (this.isSearchTask(request)) {
-      const hasSubmit = steps.some((step) =>
-        (step.tool === "press_key" && /^enter$/i.test(step.params.key ?? ""))
-        || step.tool === "search_web"
-        || (step.tool === "navigate_tab" && /[?&](q|query|search)=/i.test(step.params.url ?? ""))
-      );
-      return hasSubmit ? "Lendo resultados..." : "Enviando busca...";
-    }
-
-    if (this.isClickExtractionTask(request)) {
-      return "Lendo informação após o clique...";
-    }
-
-    return "Avaliando se a tarefa foi concluída...";
-  }
-
   private static async executeApprovedToolCalls(
     sessionId: string,
     responseText: string,
@@ -1650,7 +1310,7 @@ export class AgentLoop {
 
       try {
         let toolResult: unknown;
-        const tabId = await resolveTabId(call.params.tabId);
+        const tabId = await this.resolveTabIdWithTimeout(call.params.tabId);
 
         // Mutating tools invalidate the cache, read tools query/pull from cache
         if (this.isMutatingTool(call.name)) {
@@ -1796,6 +1456,51 @@ export class AgentLoop {
   }
 
   private static async executeToolCall(call: ToolCall): Promise<unknown> {
+    const timeoutMs = this.getToolTimeoutMs(call.name);
+    return this.withTimeout(
+      this.executeToolCallWithoutTimeout(call),
+      timeoutMs,
+      `Timeout executando ferramenta ${call.name} após ${timeoutMs}ms.`,
+    );
+  }
+
+  private static async resolveTabIdWithTimeout(tabId?: string): Promise<number> {
+    const timeoutMs = 10_000;
+    return this.withTimeout(
+      resolveTabId(tabId),
+      timeoutMs,
+      `Timeout resolvendo aba ativa após ${timeoutMs}ms.`,
+    );
+  }
+
+  private static async withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    let timeoutId: number | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+    }
+  }
+
+  private static getToolTimeoutMs(toolName: string): number {
+    if (["wait_for_element", "wait_for_page_ready", "wait_for_navigation_or_dom_change", "call_on_condition"].includes(toolName)) {
+      return 65_000;
+    }
+
+    if (["extract_page_text", "get_dom_tree", "get_page_inventory", "query_elements"].includes(toolName)) {
+      return 20_000;
+    }
+
+    return 15_000;
+  }
+
+  private static async executeToolCallWithoutTimeout(call: ToolCall): Promise<unknown> {
     if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
       const bgResponse = await chrome.runtime.sendMessage({
         type: "MCP_EXECUTE",

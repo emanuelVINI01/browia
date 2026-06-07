@@ -149,7 +149,7 @@ chrome.runtime.onMessage.addListener((message: BackgroundMessage, _sender, sendR
     return false;
   }
 
-  void handleMessage(message)
+  void withBackgroundTimeout(handleMessage(message), getBackgroundMessageTimeoutMs(message))
     .then((result) => {
       sendResponse({ ok: true, result });
     })
@@ -162,6 +162,35 @@ chrome.runtime.onMessage.addListener((message: BackgroundMessage, _sender, sendR
 
   return true;
 });
+
+function getBackgroundMessageTimeoutMs(message: BackgroundMessage): number {
+  if (message.type === "RESOLVE_ACTIVE_TAB_ID") {
+    return 10_000;
+  }
+
+  if (message.type === "MCP_EXECUTE" || message.type === "MCP_TOOL_CALL" || message.type === "MCP_RUN") {
+    return 30_000;
+  }
+
+  return 120_000;
+}
+
+async function withBackgroundTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`Timeout no background após ${timeoutMs}ms.`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
 
 async function handleMessage(message: BackgroundMessage): Promise<unknown> {
   if (message.type === "AGENT_STATE_CHANGED") {

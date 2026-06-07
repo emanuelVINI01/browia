@@ -425,8 +425,6 @@ export async function resolveElement(params: Record<string, string>): Promise<un
         traverse(document.body);
       }
 
-      const allElements = Array.from(document.querySelectorAll("*")).filter(el => !ignoredTags.has(el.tagName));
-      
       const isVisible = (element: Element) => {
         const rect = element.getBoundingClientRect();
         const style = window.getComputedStyle(element);
@@ -451,6 +449,80 @@ export async function resolveElement(params: Record<string, string>): Promise<un
         );
       };
 
+      const cleanText = (element: Element) => (element.textContent || "").trim().substring(0, 100);
+      const serializeElement = (element: Element, confidence: number, reason: string) => {
+        const rectVal = element.getBoundingClientRect();
+        return {
+          vortexId: Number(element.getAttribute("data-vortex-id") || "0"),
+          selector: inp.selector || undefined,
+          id: element.id || undefined,
+          tag: element.tagName.toLowerCase(),
+          role: element.getAttribute("role") || undefined,
+          text: cleanText(element),
+          ariaLabel: element.getAttribute("aria-label") || undefined,
+          placeholder: element.getAttribute("placeholder") || undefined,
+          rect: {
+            x: Math.round(rectVal.x),
+            y: Math.round(rectVal.y),
+            w: Math.round(rectVal.width),
+            h: Math.round(rectVal.height),
+          },
+          confidence,
+          reason,
+        };
+      };
+      const serializeCandidate = (element: Element, confidence: number) => ({
+        vortexId: Number(element.getAttribute("data-vortex-id") || "0"),
+        tag: element.tagName.toLowerCase(),
+        id: element.id || undefined,
+        text: cleanText(element),
+        ariaLabel: element.getAttribute("aria-label") || undefined,
+        role: element.getAttribute("role") || undefined,
+        placeholder: element.getAttribute("placeholder") || undefined,
+        confidence,
+      });
+      const applyVisibilityFilters = (elements: Element[]) => elements
+        .filter(el => !ignoredTags.has(el.tagName))
+        .filter(el => inp.visibleOnly === false || isVisible(el))
+        .filter(el => !inp.interactiveOnly || isInteractive(el));
+
+      let directMatches: Array<{ element: Element; score: number; reason: string }> = [];
+
+      if (inp.vortexId) {
+        const found = document.querySelector(`[data-vortex-id="${String(inp.vortexId)}"]`);
+        if (found) {
+          directMatches = [{ element: found, score: 500, reason: `Matched vortexId ${inp.vortexId}.` }];
+        }
+      } else if (inp.selector) {
+        try {
+          directMatches = applyVisibilityFilters(Array.from(document.querySelectorAll(inp.selector)))
+            .slice(0, 10)
+            .map(element => ({ element, score: 100, reason: `Matched selector ${inp.selector}.` }));
+        } catch {
+          directMatches = [];
+        }
+      } else if (inp.id) {
+        const found = document.getElementById(inp.id);
+        if (found) {
+          directMatches = [{ element: found, score: 90, reason: `Matched id ${inp.id}.` }];
+        }
+      }
+
+      if (directMatches.length > 0) {
+        const filtered = applyVisibilityFilters(directMatches.map(match => match.element));
+        const filteredMatches = directMatches.filter(match => filtered.includes(match.element));
+        if (filteredMatches.length > 0) {
+          const best = filteredMatches[inp.index ?? 0] ?? filteredMatches[0];
+          return {
+            success: true,
+            element: serializeElement(best.element, best.score, best.reason),
+            candidates: filteredMatches.slice(0, 5).map(match => serializeCandidate(match.element, match.score)),
+          };
+        }
+      }
+
+      const allElements = Array.from(document.querySelectorAll("*")).filter(el => !ignoredTags.has(el.tagName));
+
       let candidates = allElements;
       
       if (inp.visibleOnly !== false) {
@@ -467,7 +539,7 @@ export async function resolveElement(params: Record<string, string>): Promise<un
         const id = el.id || "";
         const nameAttr = el.getAttribute("name") || "";
         const ariaLabelAttr = el.getAttribute("aria-label") || "";
-        const textVal = (el.textContent || "").trim();
+        const textVal = inp.text || inp.textContains ? (el.textContent || "").trim() : "";
         const placeholderAttr = el.getAttribute("placeholder") || "";
         const roleAttr = el.getAttribute("role") || "";
 
@@ -538,36 +610,13 @@ export async function resolveElement(params: Record<string, string>): Promise<un
       const best = matches[0];
       const confidence = best.score;
       const bestEl = best.element;
-      const vortexIdVal = Number(bestEl.getAttribute("data-vortex-id") || "0");
-      const rectVal = bestEl.getBoundingClientRect();
       
-      const topCandidates = matches.slice(0, 5).map(m => ({
-        vortexId: Number(m.element.getAttribute("data-vortex-id") || "0"),
-        tag: m.element.tagName.toLowerCase(),
-        id: m.element.id || undefined,
-        text: (m.element.textContent || "").trim().substring(0, 100),
-        ariaLabel: m.element.getAttribute("aria-label") || undefined,
-        role: m.element.getAttribute("role") || undefined,
-        placeholder: m.element.getAttribute("placeholder") || undefined,
-        confidence: m.score,
-      }));
+      const topCandidates = matches.slice(0, 5).map(m => serializeCandidate(m.element, m.score));
 
       if (confidence >= 30 || matches.length === 1) {
         return {
           success: true,
-          element: {
-            vortexId: vortexIdVal,
-            selector: inp.selector || undefined,
-            id: bestEl.id || undefined,
-            tag: bestEl.tagName.toLowerCase(),
-            role: bestEl.getAttribute("role") || undefined,
-            text: (bestEl.textContent || "").trim().substring(0, 100),
-            ariaLabel: bestEl.getAttribute("aria-label") || undefined,
-            placeholder: bestEl.getAttribute("placeholder") || undefined,
-            rect: { x: Math.round(rectVal.x), y: Math.round(rectVal.y), w: Math.round(rectVal.width), h: Math.round(rectVal.height) },
-            confidence,
-            reason: `Matched with score ${confidence}.`
-          },
+          element: serializeElement(bestEl, confidence, `Matched with score ${confidence}.`),
           candidates: topCandidates
         };
       }

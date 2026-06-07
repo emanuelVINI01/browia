@@ -80,9 +80,6 @@ export class TokenBudgetManager {
     if (this.totalInputTokens + this.totalOutputTokens + this.totalToolResultTokens + estNextInput > budget.maxTokensPerTask) {
       return { exceeded: true, reason: `Excedido limite de tokens por tarefa (${budget.maxTokensPerTask}).` };
     }
-    if (this.requestCount >= budget.maxRequestsPerTask) {
-      return { exceeded: true, reason: `Excedido limite de chamadas por tarefa (${budget.maxRequestsPerTask}).` };
-    }
     return { exceeded: false };
   }
 
